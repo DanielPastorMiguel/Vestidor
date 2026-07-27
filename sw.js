@@ -1,6 +1,6 @@
 // sw.js — cachea el "app shell" para que la PWA funcione offline.
 // Sube este número cada vez que cambies archivos para forzar la actualización.
-const CACHE_NAME = 'armario-cache-v1';
+const CACHE_NAME = 'armario-cache-v1.1';
 
 const APP_SHELL = [
   './',
