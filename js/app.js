@@ -1,0 +1,1215 @@
+import { DB, uid, todayStr } from './db.js';
+import { processGarmentPhoto } from './crop.js';
+import { generarOutfitConGemini } from './gemini.js';
+import { exportarDatos, importarDatos } from './backup.js';
+import { PALETTE } from './colors.js';
+
+/* ===================== CONSTANTES ===================== */
+const SUBTIPOS = {
+  arriba: ['abrigo', 'americana', 'camisa', 'camiseta', 'chaleco', 'chaqueta', 'jersey', 'blusa', 'vestido'],
+  abajo: ['bermudas', 'falda', 'chino', 'vaquero', 'chándal', 'vestido'],
+  calzado: ['invierno', 'verano'],
+};
+const TEMPORADAS = ['verano', 'invierno', 'entretiempo'];
+const OCASIONES = ['casual', 'formal', 'deporte', 'fiesta'];
+const CATEGORIAS = ['arriba', 'abajo', 'calzado'];
+const CATEGORIA_LABEL = { arriba: 'Arriba', abajo: 'Abajo', calzado: 'Calzado' };
+
+/* ===================== UTILIDADES ===================== */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $all = (sel, root = document) => [...root.querySelectorAll(sel)];
+const view = document.getElementById('view');
+
+function nameToHex(name) {
+  const c = PALETTE.find((p) => p.name === name);
+  if (!c) return '#888888';
+  return '#' + c.rgb.map((v) => v.toString(16).padStart(2, '0')).join('');
+}
+
+function addDays(fechaStr, n) {
+  const d = new Date(fechaStr + 'T00:00:00');
+  d.setDate(d.getDate() + n);
+  return todayStr(d);
+}
+
+function fmtFechaLarga(fechaStr) {
+  const d = new Date(fechaStr + 'T00:00:00');
+  const dow = d.toLocaleDateString('es-ES', { weekday: 'long' });
+  const dia = d.getDate();
+  const mes = d.toLocaleDateString('es-ES', { month: 'long' });
+  return { dow: cap(dow), dia, mes: cap(mes) };
+}
+function cap(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function refocus(el) {
+  if (!el) return;
+  el.focus();
+  const v = el.value;
+  try {
+    el.setSelectionRange(v.length, v.length);
+  } catch (e) {
+    /* algunos inputs no soportan setSelectionRange */
+  }
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function chipSelectHtml(name, options, selected, capitalizeLabels = true) {
+  return `<div class="chip-select" data-field="${name}">${options
+    .map(
+      (o) =>
+        `<button type="button" data-value="${escapeHtml(o)}" class="${o === selected ? 'active' : ''}">${
+          capitalizeLabels ? cap(o) : escapeHtml(o)
+        }</button>`
+    )
+    .join('')}</div>`;
+}
+function wireChipSelect(root, name, onChange) {
+  const box = $(`.chip-select[data-field="${name}"]`, root);
+  if (!box) return;
+  box.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    $all('button', box).forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    onChange(btn.dataset.value);
+  });
+}
+
+/* ===================== ESTADO ===================== */
+const state = {
+  selectedDate: todayStr(),
+  calendarMonth: new Date(),
+  editOpen: false,
+  manualDraft: null,
+  geminiDraft: null,
+};
+
+let prendasCache = null;
+async function getPrendas(force = false) {
+  if (!prendasCache || force) prendasCache = await DB.getAllPrendas();
+  return prendasCache;
+}
+function invalidatePrendasCache() {
+  prendasCache = null;
+}
+
+/* ===================== TOAST ===================== */
+function toast(msg, type = 'ok') {
+  const root = document.getElementById('toast-root');
+  const el = document.createElement('div');
+  el.className = 'toast' + (type === 'error' ? ' error' : '');
+  el.textContent = msg;
+  root.appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+
+/* ===================== MODAL (bottom sheet) ===================== */
+function openSheet(html) {
+  const root = document.getElementById('modal-root');
+  root.innerHTML = `<div class="modal-backdrop" id="modal-backdrop"><div class="modal-sheet"><div class="sheet-handle"></div>${html}</div></div>`;
+  $('#modal-backdrop').addEventListener('click', (e) => {
+    if (e.target.id === 'modal-backdrop') closeSheet();
+  });
+  return $('.modal-sheet');
+}
+function closeSheet() {
+  document.getElementById('modal-root').innerHTML = '';
+}
+
+/* ===================== RECONCILIACIÓN DE USO ===================== */
+async function reconcilePastOutfits() {
+  const today = todayStr();
+  const [outfits, prendas] = await Promise.all([DB.getAllOutfits(), getPrendas(true)]);
+  const pasados = outfits.filter((o) => o.fecha < today);
+  const usage = new Map();
+  for (const o of pasados) {
+    for (const id of [o.prenda_arriba_id, o.prenda_abajo_id, o.prenda_calzado_id]) {
+      if (!id) continue;
+      const u = usage.get(id) || { count: 0, last: null };
+      u.count++;
+      if (!u.last || o.fecha > u.last) u.last = o.fecha;
+      usage.set(id, u);
+    }
+  }
+  for (const p of prendas) {
+    const u = usage.get(p.id) || { count: 0, last: null };
+    if (p.veces_usada !== u.count || p.ultima_vez_usada !== u.last) {
+      p.veces_usada = u.count;
+      p.ultima_vez_usada = u.last;
+      await DB.updatePrenda(p);
+    }
+  }
+  invalidatePrendasCache();
+}
+
+async function guardarOutfit(outfit) {
+  await DB.setOutfit(outfit);
+  await reconcilePastOutfits();
+}
+
+/* ===================== HOME ===================== */
+async function renderHome() {
+  const fecha = state.selectedDate;
+  const [outfit, prendas] = await Promise.all([DB.getOutfit(fecha), getPrendas()]);
+  const prendaMap = new Map(prendas.map((p) => [p.id, p]));
+  const { dow, dia, mes } = fmtFechaLarga(fecha);
+  const hasOutfit = !!(outfit && (outfit.prenda_arriba_id || outfit.prenda_abajo_id || outfit.prenda_calzado_id));
+
+  const filaHtml = (categoria, id) => {
+    const p = prendaMap.get(id);
+    if (!p) {
+      return `<div class="outfit-row empty"><span>Sin ${CATEGORIA_LABEL[categoria].toLowerCase()}</span></div>`;
+    }
+    return `<div class="outfit-row">
+      <div class="thumb"><img src="${p.foto_recortada}" alt="${escapeHtml(p.titulo)}" /></div>
+      <div class="meta">
+        <div class="cat-label">${CATEGORIA_LABEL[categoria]}</div>
+        <div class="titulo">${escapeHtml(p.titulo)}</div>
+        <div class="colores"><span class="swatch" style="background:${nameToHex(p.color_principal)}"></span>${escapeHtml(p.color_principal)}${
+      p.color_secundario ? ' / <span class="swatch" style="background:' + nameToHex(p.color_secundario) + '"></span>' + escapeHtml(p.color_secundario) : ''
+    }</div>
+      </div>
+    </div>`;
+  };
+
+  const personas = (outfit && outfit.personas) || [];
+
+  view.innerHTML = `
+    <div class="date-nav">
+      <button class="arrow" id="date-prev" aria-label="Día anterior">‹</button>
+      <button class="date-label" id="date-open-cal">
+        <span class="d1">${dia} ${mes}</span>
+        <span class="d2">${dow}</span>
+      </button>
+      <button class="arrow" id="date-next" aria-label="Día siguiente">›</button>
+    </div>
+
+    ${
+      hasOutfit
+        ? `<div class="outfit-grid">
+            ${filaHtml('arriba', outfit.prenda_arriba_id)}
+            ${filaHtml('abajo', outfit.prenda_abajo_id)}
+            ${filaHtml('calzado', outfit.prenda_calzado_id)}
+          </div>
+          ${
+            personas.length
+              ? `<div class="section-label">Con</div><div class="personas-list">${personas
+                  .map((n) => `<span class="persona-chip">${escapeHtml(n)}</span>`)
+                  .join('')}</div>`
+              : ''
+          }
+          ${outfit.notas ? `<div class="reasoning-card">${escapeHtml(outfit.notas)}</div>` : ''}
+          `
+        : `<div class="empty-state">
+            <div class="icon">👔</div>
+            <div>Todavía no hay outfit para este día</div>
+          </div>
+          <div class="choice-row">
+            <button class="choice-card primary" id="btn-gemini-direct">
+              <span class="emoji">✨</span>
+              <span><span class="title">Generar con Gemini</span><br/><span class="sub">Tu estilista elige por ti</span></span>
+            </button>
+            <button class="choice-card" id="btn-manual-direct">
+              <span class="emoji">✏️</span>
+              <span><span class="title">Crear a mano</span><br/><span class="sub">Elige tú cada prenda</span></span>
+            </button>
+          </div>`
+    }
+
+    <button class="btn btn-outline btn-block" id="btn-toggle-edit" style="margin-top:20px;">
+      ${hasOutfit ? 'Editar outfit' : 'Opciones'}
+    </button>
+    <div id="edit-outfit-options" class="hidden">
+      <button class="choice-card primary" id="btn-gemini">
+        <span class="emoji">✨</span>
+        <span><span class="title">Generar con Gemini</span></span>
+      </button>
+      <button class="choice-card" id="btn-manual">
+        <span class="emoji">✏️</span>
+        <span><span class="title">Crear a mano</span></span>
+      </button>
+    </div>
+  `;
+
+  $('#date-prev').addEventListener('click', () => {
+    state.selectedDate = addDays(state.selectedDate, -1);
+    renderHome();
+  });
+  $('#date-next').addEventListener('click', () => {
+    state.selectedDate = addDays(state.selectedDate, 1);
+    renderHome();
+  });
+  $('#date-open-cal').addEventListener('click', () => {
+    state.calendarMonth = new Date(state.selectedDate + 'T00:00:00');
+    renderCalendar();
+  });
+  const goGemini = () => renderGeminiForm();
+  const goManual = () => renderManual();
+  if ($('#btn-gemini-direct')) $('#btn-gemini-direct').addEventListener('click', goGemini);
+  if ($('#btn-manual-direct')) $('#btn-manual-direct').addEventListener('click', goManual);
+  $('#btn-gemini').addEventListener('click', goGemini);
+  $('#btn-manual').addEventListener('click', goManual);
+  $('#btn-toggle-edit').addEventListener('click', () => {
+    $('#edit-outfit-options').classList.toggle('hidden');
+  });
+}
+
+/* ===================== CALENDARIO ===================== */
+async function renderCalendar() {
+  const month = state.calendarMonth;
+  const y = month.getFullYear();
+  const m = month.getMonth();
+  const first = new Date(y, m, 1);
+  const startOffset = (first.getDay() + 6) % 7; // lunes=0
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const monthLabel = cap(first.toLocaleDateString('es-ES', { month: 'long', year: 'numeric' }));
+
+  const [outfits, prendas] = await Promise.all([DB.getAllOutfits(), getPrendas()]);
+  const prendaMap = new Map(prendas.map((p) => [p.id, p]));
+  const outfitMap = new Map(outfits.map((o) => [o.fecha, o]));
+  const today = todayStr();
+
+  const dows = ['L', 'M', 'X', 'J', 'V', 'S', 'D'];
+  let cells = '';
+  for (let i = 0; i < startOffset; i++) {
+    const d = new Date(y, m, 1 - (startOffset - i));
+    cells += dayCellHtml(d, true, outfitMap, prendaMap, today);
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    cells += dayCellHtml(new Date(y, m, d), false, outfitMap, prendaMap, today);
+  }
+  const totalCells = startOffset + daysInMonth;
+  const trailing = (7 - (totalCells % 7)) % 7;
+  for (let i = 1; i <= trailing; i++) {
+    cells += dayCellHtml(new Date(y, m + 1, i), true, outfitMap, prendaMap, today);
+  }
+
+  view.innerHTML = `
+    <div class="screen-header">
+      <button class="back-btn" id="cal-back">‹</button>
+      <div class="screen-title">CALENDARIO</div>
+    </div>
+    <div class="cal-header">
+      <button class="arrow" id="cal-prev-month">‹</button>
+      <div class="cal-month">${monthLabel}</div>
+      <button class="arrow" id="cal-next-month">›</button>
+    </div>
+    <div class="cal-grid">
+      ${dows.map((d) => `<div class="cal-dow">${d}</div>`).join('')}
+      ${cells}
+    </div>
+  `;
+
+  $('#cal-back').addEventListener('click', renderHome);
+  $('#cal-prev-month').addEventListener('click', () => {
+    state.calendarMonth = new Date(y, m - 1, 1);
+    renderCalendar();
+  });
+  $('#cal-next-month').addEventListener('click', () => {
+    state.calendarMonth = new Date(y, m + 1, 1);
+    renderCalendar();
+  });
+  $all('.cal-day[data-fecha]').forEach((el) => {
+    el.addEventListener('click', () => {
+      state.selectedDate = el.dataset.fecha;
+      renderHome();
+    });
+  });
+}
+
+function dayCellHtml(dateObj, otherMonth, outfitMap, prendaMap, today) {
+  const fecha = todayStr(dateObj);
+  const outfit = outfitMap.get(fecha);
+  const classes = ['cal-day'];
+  if (otherMonth) classes.push('other-month');
+  if (fecha === today) classes.push('today');
+  if (fecha === state.selectedDate) classes.push('selected');
+
+  let bars = '';
+  if (outfit) {
+    const cats = [outfit.prenda_arriba_id, outfit.prenda_abajo_id, outfit.prenda_calzado_id];
+    bars = `<div class="bars">${cats
+      .map((id) => {
+        const p = prendaMap.get(id);
+        if (!p) return `<div class="bar"><span style="width:100%;background:#333"></span></div>`;
+        const c1 = nameToHex(p.color_principal);
+        const c2 = p.color_secundario ? nameToHex(p.color_secundario) : null;
+        return `<div class="bar"><span style="width:${c2 ? '70%' : '100%'};background:${c1}"></span>${
+          c2 ? `<span style="width:30%;background:${c2}"></span>` : ''
+        }</div>`;
+      })
+      .join('')}</div>`;
+  }
+
+  return `<button class="${classes.join(' ')}" data-fecha="${fecha}">
+    <span>${dateObj.getDate()}</span>
+    ${bars}
+  </button>`;
+}
+
+/* ===================== CREAR OUTFIT A MANO ===================== */
+async function renderManual() {
+  const fecha = state.selectedDate;
+  if (!state.manualDraft || state.manualDraft.fecha !== fecha) {
+    const existing = await DB.getOutfit(fecha);
+    state.manualDraft = {
+      fecha,
+      prenda_arriba_id: existing?.prenda_arriba_id || null,
+      prenda_abajo_id: existing?.prenda_abajo_id || null,
+      prenda_calzado_id: existing?.prenda_calzado_id || null,
+      personas: existing?.personas ? [...existing.personas] : [],
+      notas: existing?.notas || '',
+    };
+  }
+  await paintManual();
+}
+
+async function paintManual() {
+  const draft = state.manualDraft;
+  const prendas = await getPrendas();
+  const prendaMap = new Map(prendas.map((p) => [p.id, p]));
+  const { dow, dia, mes } = fmtFechaLarga(draft.fecha);
+
+  const catBlock = (categoria, id) => {
+    const p = prendaMap.get(id);
+    return `<div class="field">
+      <label>${CATEGORIA_LABEL[categoria]}</label>
+      <button type="button" class="outfit-row" data-pick="${categoria}" style="width:100%;">
+        ${
+          p
+            ? `<div class="thumb"><img src="${p.foto_recortada}" alt=""/></div>
+               <div class="meta"><div class="titulo">${escapeHtml(p.titulo)}</div><div class="colores">${escapeHtml(p.color_principal)}${
+                p.color_secundario ? ' / ' + escapeHtml(p.color_secundario) : ''
+              }</div></div>`
+            : `<span style="color:var(--text-faint)">Elegir ${categoria === 'calzado' ? 'calzado' : 'prenda de ' + categoria}</span>`
+        }
+      </button>
+    </div>`;
+  };
+
+  view.innerHTML = `
+    <div class="screen-header">
+      <button class="back-btn" id="manual-back">‹</button>
+      <div class="screen-title">CREAR A MANO</div>
+    </div>
+    <div class="screen-sub">${dow}, ${dia} de ${mes}</div>
+
+    ${catBlock('arriba', draft.prenda_arriba_id)}
+    ${catBlock('abajo', draft.prenda_abajo_id)}
+    ${catBlock('calzado', draft.prenda_calzado_id)}
+
+    <div class="field">
+      <label>Personas</label>
+      <div class="personas-list" id="manual-personas">
+        ${draft.personas.map((n) => `<span class="persona-chip removable" data-nombre="${escapeHtml(n)}">${escapeHtml(n)}<span class="x">✕</span></span>`).join('')}
+        <button type="button" class="persona-chip" id="btn-add-persona" style="border-style:dashed;">+ Añadir</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Notas (opcional)</label>
+      <textarea id="manual-notas" placeholder="Cualquier apunte sobre este outfit...">${escapeHtml(draft.notas)}</textarea>
+    </div>
+
+    <button class="btn btn-primary btn-block" id="manual-guardar">Guardar outfit</button>
+  `;
+
+  $('#manual-back').addEventListener('click', () => {
+    state.manualDraft = null;
+    renderHome();
+  });
+  $all('[data-pick]').forEach((btn) => {
+    btn.addEventListener('click', () => openGarmentPicker(btn.dataset.pick));
+  });
+  $('#btn-add-persona').addEventListener('click', openPersonaPicker);
+  $all('#manual-personas .x').forEach((x) => {
+    x.addEventListener('click', (e) => {
+      const nombre = e.target.closest('.persona-chip').dataset.nombre;
+      draft.personas = draft.personas.filter((n) => n !== nombre);
+      paintManual();
+    });
+  });
+  $('#manual-notas').addEventListener('input', (e) => {
+    draft.notas = e.target.value;
+  });
+  $('#manual-guardar').addEventListener('click', async () => {
+    if (!draft.prenda_arriba_id && !draft.prenda_abajo_id && !draft.prenda_calzado_id) {
+      toast('Elige al menos una prenda', 'error');
+      return;
+    }
+    await guardarOutfit({ ...draft, origen: 'manual' });
+    state.manualDraft = null;
+    toast('Outfit guardado');
+    renderHome();
+  });
+}
+
+function openGarmentPicker(categoria) {
+  let query = '';
+  let subtipoFiltro = null;
+
+  const paint = async () => {
+    const prendas = (await getPrendas()).filter((p) => p.activa && p.categoria === categoria);
+    const filtradas = prendas.filter((p) => {
+      if (subtipoFiltro && p.subtipo !== subtipoFiltro) return false;
+      if (query && !p.titulo.toLowerCase().includes(query.toLowerCase())) return false;
+      return true;
+    });
+    const sheet = openSheet(`
+      <div class="screen-title" style="margin-bottom:10px;">Elegir ${CATEGORIA_LABEL[categoria].toLowerCase()}</div>
+      <div class="search-bar">
+        <span>🔍</span>
+        <input type="text" id="picker-search" placeholder="Buscar por título..." value="${escapeHtml(query)}" />
+      </div>
+      <div class="chip-select" id="picker-subtipos" style="margin-bottom:14px;">
+        <button type="button" data-value="" class="${!subtipoFiltro ? 'active' : ''}">Todos</button>
+        ${SUBTIPOS[categoria]
+          .map((s) => `<button type="button" data-value="${s}" class="${subtipoFiltro === s ? 'active' : ''}">${cap(s)}</button>`)
+          .join('')}
+      </div>
+      <div class="garment-grid" id="picker-grid">
+        ${
+          filtradas.length
+            ? filtradas
+                .map(
+                  (p) => `<button type="button" class="garment-card" data-id="${p.id}">
+                <div class="thumb"><img src="${p.foto_recortada}" alt=""/></div>
+                <div class="cap"><div class="t">${escapeHtml(p.titulo)}</div><div class="c">${escapeHtml(p.subtipo)}</div></div>
+              </button>`
+                )
+                .join('')
+            : `<div class="garment-empty">No hay prendas que coincidan</div>`
+        }
+      </div>
+    `);
+    $('#picker-search', sheet).addEventListener('input', (e) => {
+      query = e.target.value;
+      keepFocus = true;
+      paint();
+    });
+    $('#picker-subtipos', sheet).addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      subtipoFiltro = b.dataset.value || null;
+      paint();
+    });
+    $all('.garment-card', sheet).forEach((c) => {
+      c.addEventListener('click', () => {
+        state.manualDraft['prenda_' + categoria + '_id'] = c.dataset.id;
+        closeSheet();
+        paintManual();
+      });
+    });
+    if (keepFocus) refocus($('#picker-search', sheet));
+  };
+  let keepFocus = false;
+  paint();
+}
+
+async function openPersonaPicker() {
+  const draft = state.manualDraft;
+  let query = '';
+  const paint = async () => {
+    const personas = await DB.getAllPersonas();
+    const filtradas = personas.filter((p) => p.nombre.toLowerCase().includes(query.toLowerCase()));
+    const sheet = openSheet(`
+      <div class="screen-title" style="margin-bottom:10px;">Personas</div>
+      <div class="search-bar">
+        <span>🔍</span>
+        <input type="text" id="persona-search" placeholder="Buscar o añadir nueva..." value="${escapeHtml(query)}" />
+      </div>
+      <div id="persona-list">
+        ${filtradas
+          .map(
+            (p) => `<div class="persona-pick-row" data-nombre="${escapeHtml(p.nombre)}">
+              <span class="name">${escapeHtml(p.nombre)}</span>
+              <span class="checkbox ${draft.personas.includes(p.nombre) ? 'checked' : ''}">✓</span>
+            </div>`
+          )
+          .join('')}
+      </div>
+      ${
+        query && !personas.some((p) => p.nombre.toLowerCase() === query.toLowerCase())
+          ? `<button class="btn btn-outline btn-block" id="persona-add-new" style="margin-top:10px;">+ Añadir "${escapeHtml(query)}"</button>`
+          : ''
+      }
+      <button class="btn btn-primary btn-block" id="persona-done" style="margin-top:16px;">Listo</button>
+    `);
+    $('#persona-search', sheet).addEventListener('input', (e) => {
+      query = e.target.value;
+      keepFocus = true;
+      paint();
+    });
+    $all('.persona-pick-row', sheet).forEach((row) => {
+      row.addEventListener('click', () => {
+        const nombre = row.dataset.nombre;
+        if (draft.personas.includes(nombre)) draft.personas = draft.personas.filter((n) => n !== nombre);
+        else draft.personas.push(nombre);
+        paint();
+      });
+    });
+    if ($('#persona-add-new', sheet)) {
+      $('#persona-add-new', sheet).addEventListener('click', async () => {
+        await DB.addPersona({ nombre: query });
+        draft.personas.push(query);
+        query = '';
+        paint();
+      });
+    }
+    $('#persona-done', sheet).addEventListener('click', () => {
+      closeSheet();
+      paintManual();
+    });
+    if (keepFocus) refocus($('#persona-search', sheet));
+  };
+  let keepFocus = false;
+  paint();
+}
+
+/* ===================== GENERAR CON GEMINI ===================== */
+async function renderGeminiForm() {
+  const fecha = state.selectedDate;
+  if (!state.geminiDraft || state.geminiDraft.fecha !== fecha) {
+    state.geminiDraft = { fecha, ocasion: 'casual', temporada: 'entretiempo', personas: [], ciudad: '', comentarios: '' };
+  }
+  const draft = state.geminiDraft;
+  const { dow, dia, mes } = fmtFechaLarga(fecha);
+
+  view.innerHTML = `
+    <div class="screen-header">
+      <button class="back-btn" id="gemini-back">‹</button>
+      <div class="screen-title">GENERAR CON GEMINI</div>
+    </div>
+    <div class="screen-sub">${dow}, ${dia} de ${mes}</div>
+
+    <div class="field">
+      <label>Ocasión</label>
+      ${chipSelectHtml('ocasion', OCASIONES, draft.ocasion)}
+    </div>
+    <div class="field">
+      <label>Temporada</label>
+      ${chipSelectHtml('temporada', TEMPORADAS, draft.temporada)}
+    </div>
+    <div class="field">
+      <label>Personas</label>
+      <div class="personas-list" id="gemini-personas">
+        ${draft.personas.map((n) => `<span class="persona-chip removable" data-nombre="${escapeHtml(n)}">${escapeHtml(n)}<span class="x">✕</span></span>`).join('')}
+        <button type="button" class="persona-chip" id="btn-add-persona-g" style="border-style:dashed;">+ Añadir</button>
+      </div>
+    </div>
+    <div class="field">
+      <label>Ciudad</label>
+      <input type="text" id="gemini-ciudad" placeholder="Ej: Madrid" value="${escapeHtml(draft.ciudad)}" />
+    </div>
+    <div class="field">
+      <label>Comentarios</label>
+      <textarea id="gemini-comentarios" placeholder="Ej: quiero ir cómodo, va a llover...">${escapeHtml(draft.comentarios)}</textarea>
+    </div>
+
+    <button class="btn btn-primary btn-block" id="gemini-generar">✨ Generar outfit</button>
+  `;
+
+  $('#gemini-back').addEventListener('click', () => {
+    state.geminiDraft = null;
+    renderHome();
+  });
+  wireChipSelect(view, 'ocasion', (v) => (draft.ocasion = v));
+  wireChipSelect(view, 'temporada', (v) => (draft.temporada = v));
+  $('#gemini-ciudad').addEventListener('input', (e) => (draft.ciudad = e.target.value));
+  $('#gemini-comentarios').addEventListener('input', (e) => (draft.comentarios = e.target.value));
+  $('#btn-add-persona-g').addEventListener('click', () => openPersonaPickerGemini());
+  $all('#gemini-personas .x').forEach((x) => {
+    x.addEventListener('click', (e) => {
+      const nombre = e.target.closest('.persona-chip').dataset.nombre;
+      draft.personas = draft.personas.filter((n) => n !== nombre);
+      renderGeminiForm();
+    });
+  });
+  $('#gemini-generar').addEventListener('click', handleGenerar);
+}
+
+async function openPersonaPickerGemini() {
+  const draft = state.geminiDraft;
+  let query = '';
+  const paint = async () => {
+    const personas = await DB.getAllPersonas();
+    const filtradas = personas.filter((p) => p.nombre.toLowerCase().includes(query.toLowerCase()));
+    const sheet = openSheet(`
+      <div class="screen-title" style="margin-bottom:10px;">Personas</div>
+      <div class="search-bar"><span>🔍</span><input type="text" id="persona-search" placeholder="Buscar o añadir nueva..." value="${escapeHtml(
+        query
+      )}" /></div>
+      <div id="persona-list">
+        ${filtradas
+          .map(
+            (p) => `<div class="persona-pick-row" data-nombre="${escapeHtml(p.nombre)}">
+              <span class="name">${escapeHtml(p.nombre)}</span>
+              <span class="checkbox ${draft.personas.includes(p.nombre) ? 'checked' : ''}">✓</span>
+            </div>`
+          )
+          .join('')}
+      </div>
+      ${
+        query && !personas.some((p) => p.nombre.toLowerCase() === query.toLowerCase())
+          ? `<button class="btn btn-outline btn-block" id="persona-add-new" style="margin-top:10px;">+ Añadir "${escapeHtml(query)}"</button>`
+          : ''
+      }
+      <button class="btn btn-primary btn-block" id="persona-done" style="margin-top:16px;">Listo</button>
+    `);
+    $('#persona-search', sheet).addEventListener('input', (e) => {
+      query = e.target.value;
+      keepFocus = true;
+      paint();
+    });
+    $all('.persona-pick-row', sheet).forEach((row) => {
+      row.addEventListener('click', () => {
+        const nombre = row.dataset.nombre;
+        if (draft.personas.includes(nombre)) draft.personas = draft.personas.filter((n) => n !== nombre);
+        else draft.personas.push(nombre);
+        paint();
+      });
+    });
+    if ($('#persona-add-new', sheet)) {
+      $('#persona-add-new', sheet).addEventListener('click', async () => {
+        await DB.addPersona({ nombre: query });
+        draft.personas.push(query);
+        query = '';
+        paint();
+      });
+    }
+    $('#persona-done', sheet).addEventListener('click', () => {
+      closeSheet();
+      renderGeminiForm();
+    });
+    if (keepFocus) refocus($('#persona-search', sheet));
+  };
+  let keepFocus = false;
+  paint();
+}
+
+async function candidatosParaCategoria(categoria, { prendas, outfits, fecha, personas, diasNoRepetir }) {
+  const desde = addDays(fecha, -diasNoRepetir);
+  const usadosRecientes = new Set();
+  for (const o of outfits) {
+    if (o.fecha >= desde && o.fecha < fecha) {
+      const compartePersonas = personas.length === 0 ? true : (o.personas || []).some((p) => personas.includes(p));
+      if (compartePersonas) {
+        [o.prenda_arriba_id, o.prenda_abajo_id, o.prenda_calzado_id].forEach((id) => id && usadosRecientes.add(id));
+      }
+    }
+  }
+  let candidatos = prendas.filter((p) => p.activa && p.categoria === categoria && !usadosRecientes.has(p.id));
+  if (candidatos.length === 0) candidatos = prendas.filter((p) => p.activa && p.categoria === categoria);
+  return candidatos;
+}
+
+async function handleGenerar() {
+  const draft = state.geminiDraft;
+  view.innerHTML = `
+    <div class="screen-header"><div class="screen-title">GENERANDO...</div></div>
+    <div class="loading-block"><div class="spinner"></div><span>Consultando a tu estilista...</span></div>
+  `;
+
+  try {
+    const diasNoRepetir = (await DB.getConfig('dias_no_repetir')) || 14;
+    const [prendas, outfits] = await Promise.all([getPrendas(true), DB.getAllOutfits()]);
+
+    const candArriba = await candidatosParaCategoria('arriba', { prendas, outfits, fecha: draft.fecha, personas: draft.personas, diasNoRepetir });
+    const candAbajo = await candidatosParaCategoria('abajo', { prendas, outfits, fecha: draft.fecha, personas: draft.personas, diasNoRepetir });
+    const candCalzado = await candidatosParaCategoria('calzado', { prendas, outfits, fecha: draft.fecha, personas: draft.personas, diasNoRepetir });
+    const candidatos = [...candArriba, ...candAbajo, ...candCalzado];
+
+    if (!candArriba.length || !candAbajo.length || !candCalzado.length) {
+      throw new Error('No hay prendas activas suficientes en el vestidor para alguna categoría.');
+    }
+
+    const resultado = await generarOutfitConGemini({
+      fecha: draft.fecha,
+      ocasion: draft.ocasion,
+      temporada: draft.temporada,
+      ciudad: draft.ciudad,
+      comentarios: draft.comentarios,
+      candidatos,
+    });
+
+    renderGeminiResult(resultado);
+  } catch (err) {
+    renderGeminiError(err.message || 'Error desconocido al generar el outfit.');
+  }
+}
+
+function renderGeminiError(mensaje) {
+  view.innerHTML = `
+    <div class="screen-header">
+      <button class="back-btn" id="err-back">‹</button>
+      <div class="screen-title">NO SE PUDO GENERAR</div>
+    </div>
+    <div class="empty-state">
+      <div class="icon">⚠️</div>
+      <div>${escapeHtml(mensaje)}</div>
+    </div>
+    <div class="action-row">
+      <button class="btn btn-outline" id="err-retry">Reintentar</button>
+      <button class="btn btn-primary" id="err-manual">Crear a mano</button>
+    </div>
+  `;
+  $('#err-back').addEventListener('click', renderGeminiForm);
+  $('#err-retry').addEventListener('click', handleGenerar);
+  $('#err-manual').addEventListener('click', renderManual);
+}
+
+async function renderGeminiResult(resultado) {
+  const draft = state.geminiDraft;
+  const prendas = await getPrendas();
+  const prendaMap = new Map(prendas.map((p) => [p.id, p]));
+
+  const fila = (categoria, id) => {
+    const p = prendaMap.get(id);
+    if (!p) return `<div class="outfit-row empty"><span>Sin ${categoria}</span></div>`;
+    return `<div class="outfit-row">
+      <div class="thumb"><img src="${p.foto_recortada}" alt=""/></div>
+      <div class="meta">
+        <div class="cat-label">${CATEGORIA_LABEL[categoria]}</div>
+        <div class="titulo">${escapeHtml(p.titulo)}</div>
+        <div class="colores">${escapeHtml(p.color_principal)}${p.color_secundario ? ' / ' + escapeHtml(p.color_secundario) : ''}</div>
+      </div>
+    </div>`;
+  };
+
+  view.innerHTML = `
+    <div class="screen-header">
+      <button class="back-btn" id="res-back">‹</button>
+      <div class="screen-title">TU OUTFIT</div>
+    </div>
+    <div class="outfit-grid">
+      ${fila('arriba', resultado.prenda_arriba_id)}
+      ${fila('abajo', resultado.prenda_abajo_id)}
+      ${fila('calzado', resultado.prenda_calzado_id)}
+    </div>
+    <div class="reasoning-card">${escapeHtml(resultado.razonamiento || '')}</div>
+    <div class="action-row">
+      <button class="btn btn-outline" id="res-regenerar">Repetir</button>
+      <button class="btn btn-primary" id="res-guardar">Guardar</button>
+    </div>
+    <button class="btn btn-ghost btn-block" id="res-editar" style="margin-top:10px;">Editar a mano</button>
+  `;
+
+  $('#res-back').addEventListener('click', renderGeminiForm);
+  $('#res-regenerar').addEventListener('click', handleGenerar);
+  $('#res-guardar').addEventListener('click', async () => {
+    await guardarOutfit({
+      fecha: draft.fecha,
+      prenda_arriba_id: resultado.prenda_arriba_id,
+      prenda_abajo_id: resultado.prenda_abajo_id,
+      prenda_calzado_id: resultado.prenda_calzado_id,
+      personas: draft.personas,
+      origen: 'gemini',
+      notas: resultado.razonamiento || '',
+    });
+    state.geminiDraft = null;
+    toast('Outfit guardado');
+    renderHome();
+  });
+  $('#res-editar').addEventListener('click', () => {
+    state.manualDraft = {
+      fecha: draft.fecha,
+      prenda_arriba_id: resultado.prenda_arriba_id,
+      prenda_abajo_id: resultado.prenda_abajo_id,
+      prenda_calzado_id: resultado.prenda_calzado_id,
+      personas: draft.personas,
+      notas: resultado.razonamiento || '',
+    };
+    paintManual();
+  });
+}
+
+/* ===================== SETTINGS DRAWER ===================== */
+const drawer = document.getElementById('settings-drawer');
+const drawerContent = document.getElementById('drawer-content');
+
+function openDrawer() {
+  drawer.classList.remove('hidden');
+  renderDrawerMenu();
+}
+function closeDrawer() {
+  drawer.classList.add('hidden');
+}
+
+function renderDrawerMenu() {
+  drawerContent.innerHTML = `
+    <button class="settings-item" data-go="wardrobe">Modificar vestidor <span class="arrow">›</span></button>
+    <button class="settings-item" data-go="crear">Crear prenda <span class="arrow">›</span></button>
+    <button class="settings-item" data-go="gemini">Configuración de Gemini <span class="arrow">›</span></button>
+    <button class="settings-item" data-go="backup">Copia de seguridad <span class="arrow">›</span></button>
+  `;
+  $('[data-go="wardrobe"]', drawerContent).addEventListener('click', () => renderWardrobeGrid());
+  $('[data-go="crear"]', drawerContent).addEventListener('click', () => renderCrearPrenda());
+  $('[data-go="gemini"]', drawerContent).addEventListener('click', () => renderGeminiConfig());
+  $('[data-go="backup"]', drawerContent).addEventListener('click', () => renderBackupPanel());
+}
+
+function drawerHeaderHtml(title) {
+  return `<div class="screen-header" style="margin-bottom:14px;">
+    <button class="back-btn" id="drawer-sub-back">‹</button>
+    <div class="screen-title" style="font-size:20px;">${title}</div>
+  </div>`;
+}
+
+async function renderWardrobeGrid() {
+  let query = '';
+  let catFiltro = null;
+  let temporadaFiltro = null;
+  let ocasionFiltro = null;
+
+  const paint = async () => {
+    const prendas = (await getPrendas(true)).filter((p) => p.activa);
+    const filtradas = prendas.filter((p) => {
+      if (catFiltro && p.categoria !== catFiltro) return false;
+      if (temporadaFiltro && p.temporada !== temporadaFiltro) return false;
+      if (ocasionFiltro && p.ocasion !== ocasionFiltro) return false;
+      if (query) {
+        const q = query.toLowerCase();
+        if (!(p.titulo.toLowerCase().includes(q) || p.subtipo.toLowerCase().includes(q) || p.color_principal.toLowerCase().includes(q))) return false;
+      }
+      return true;
+    });
+
+    drawerContent.innerHTML = `
+      ${drawerHeaderHtml('VESTIDOR')}
+      <div class="search-bar">
+        <span>🔍</span>
+        <input type="text" id="w-search" placeholder="Buscar por título, subtipo o color..." value="${escapeHtml(query)}" />
+      </div>
+      <div class="chip-select" id="w-cat" style="margin-bottom:8px;">
+        <button type="button" data-value="" class="${!catFiltro ? 'active' : ''}">Todas</button>
+        ${CATEGORIAS.map((c) => `<button type="button" data-value="${c}" class="${catFiltro === c ? 'active' : ''}">${CATEGORIA_LABEL[c]}</button>`).join('')}
+      </div>
+      <div class="chip-select" id="w-temp" style="margin-bottom:8px;">
+        <button type="button" data-value="" class="${!temporadaFiltro ? 'active' : ''}">Toda temporada</button>
+        ${TEMPORADAS.map((t) => `<button type="button" data-value="${t}" class="${temporadaFiltro === t ? 'active' : ''}">${cap(t)}</button>`).join('')}
+      </div>
+      <div class="chip-select" id="w-oca" style="margin-bottom:16px;">
+        <button type="button" data-value="" class="${!ocasionFiltro ? 'active' : ''}">Toda ocasión</button>
+        ${OCASIONES.map((o) => `<button type="button" data-value="${o}" class="${ocasionFiltro === o ? 'active' : ''}">${cap(o)}</button>`).join('')}
+      </div>
+      <div class="garment-grid">
+        ${
+          filtradas.length
+            ? filtradas
+                .map(
+                  (p) => `<button type="button" class="garment-card" data-id="${p.id}">
+              <div class="thumb"><img src="${p.foto_recortada}" alt=""/></div>
+              <div class="cap"><div class="t">${escapeHtml(p.titulo)}</div><div class="c">${escapeHtml(p.subtipo)}</div></div>
+            </button>`
+                )
+                .join('')
+            : `<div class="garment-empty">No se encontraron prendas</div>`
+        }
+      </div>
+    `;
+    $('#drawer-sub-back').addEventListener('click', renderDrawerMenu);
+    $('#w-search').addEventListener('input', (e) => {
+      query = e.target.value;
+      keepFocus = true;
+      paint();
+    });
+    $('#w-cat').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) {
+        catFiltro = b.dataset.value || null;
+        paint();
+      }
+    });
+    $('#w-temp').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) {
+        temporadaFiltro = b.dataset.value || null;
+        paint();
+      }
+    });
+    $('#w-oca').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) {
+        ocasionFiltro = b.dataset.value || null;
+        paint();
+      }
+    });
+    $all('.garment-card', drawerContent).forEach((c) => {
+      c.addEventListener('click', () => renderPrendaDetail(c.dataset.id));
+    });
+    if (keepFocus) refocus($('#w-search'));
+  };
+  let keepFocus = false;
+  paint();
+}
+
+async function renderPrendaDetail(id) {
+  const prenda = await DB.getPrenda(id);
+  if (!prenda) return renderWardrobeGrid();
+
+  drawerContent.innerHTML = `
+    ${drawerHeaderHtml(prenda.titulo)}
+    <div class="detail-photo"><img src="${prenda.foto_recortada}" alt=""/></div>
+    <div class="detail-grid">
+      <div><div class="k">Categoría</div><div class="v">${CATEGORIA_LABEL[prenda.categoria]}</div></div>
+      <div><div class="k">Subtipo</div><div class="v">${cap(prenda.subtipo)}</div></div>
+      <div><div class="k">Color principal</div><div class="v"><span class="swatch" style="background:${nameToHex(prenda.color_principal)}"></span>${cap(
+    prenda.color_principal
+  )}</div></div>
+      <div><div class="k">Color secundario</div><div class="v">${
+        prenda.color_secundario ? `<span class="swatch" style="background:${nameToHex(prenda.color_secundario)}"></span>${cap(prenda.color_secundario)}` : '—'
+      }</div></div>
+      <div><div class="k">Temporada</div><div class="v">${cap(prenda.temporada)}</div></div>
+      <div><div class="k">Ocasión</div><div class="v">${cap(prenda.ocasion)}</div></div>
+      <div><div class="k">Veces usada</div><div class="v">${prenda.veces_usada || 0}</div></div>
+      <div><div class="k">Última vez</div><div class="v">${prenda.ultima_vez_usada || '—'}</div></div>
+      <div><div class="k">Añadida</div><div class="v">${prenda.fecha_anadida}</div></div>
+    </div>
+    <div class="action-row">
+      <button class="btn btn-outline" id="prenda-editar">Editar</button>
+      <button class="btn btn-danger" id="prenda-eliminar">Eliminar</button>
+    </div>
+  `;
+  $('#drawer-sub-back').addEventListener('click', renderWardrobeGrid);
+  $('#prenda-editar').addEventListener('click', () => renderCrearPrenda(prenda.id));
+  $('#prenda-eliminar').addEventListener('click', () => {
+    openSheet(`
+      <div class="screen-title" style="margin-bottom:10px;">¿Eliminar "${escapeHtml(prenda.titulo)}"?</div>
+      <div class="screen-sub">No se borrará el histórico de outfits que la usaron.</div>
+      <div class="action-row">
+        <button class="btn btn-outline" id="del-cancel">Cancelar</button>
+        <button class="btn btn-danger" id="del-confirm">Eliminar</button>
+      </div>
+    `);
+    $('#del-cancel').addEventListener('click', closeSheet);
+    $('#del-confirm').addEventListener('click', async () => {
+      prenda.activa = false;
+      await DB.updatePrenda(prenda);
+      invalidatePrendasCache();
+      closeSheet();
+      toast('Prenda eliminada del vestidor');
+      renderWardrobeGrid();
+    });
+  });
+}
+
+async function renderCrearPrenda(editId = null) {
+  const editing = !!editId;
+  const prenda = editing ? await DB.getPrenda(editId) : null;
+
+  const draft = editing
+    ? { ...prenda }
+    : { titulo: '', categoria: 'arriba', subtipo: SUBTIPOS.arriba[0], temporada: 'entretiempo', ocasion: 'casual', foto_recortada: null, color_principal: null, color_secundario: null };
+
+  const paint = () => {
+    drawerContent.innerHTML = `
+      ${drawerHeaderHtml(editing ? 'EDITAR PRENDA' : 'CREAR PRENDA')}
+
+      <div class="field">
+        <label>Foto</label>
+        <div class="detail-photo" id="foto-preview">
+          ${draft.foto_recortada ? `<img src="${draft.foto_recortada}" alt=""/>` : `<span style="color:var(--text-faint);font-size:13px;">Sin foto todavía</span>`}
+        </div>
+        <input type="file" id="foto-input" accept="image/*" class="hidden" />
+        <button type="button" class="btn btn-outline btn-block" id="foto-elegir">${draft.foto_recortada ? 'Cambiar foto' : 'Elegir foto de la galería'}</button>
+      </div>
+
+      <div class="field">
+        <label>Título</label>
+        <input type="text" id="p-titulo" placeholder="Ej: Camisa vaquera" value="${escapeHtml(draft.titulo)}" />
+      </div>
+
+      <div class="field">
+        <label>Categoría</label>
+        <div class="chip-select" data-field="categoria">
+          ${CATEGORIAS.map((c) => `<button type="button" data-value="${c}" class="${draft.categoria === c ? 'active' : ''}">${CATEGORIA_LABEL[c]}</button>`).join('')}
+        </div>
+      </div>
+      <div class="field">
+        <label>Subtipo</label>
+        <div class="chip-select" id="p-subtipo-box">
+          ${SUBTIPOS[draft.categoria].map((s) => `<button type="button" data-value="${s}" class="${draft.subtipo === s ? 'active' : ''}">${cap(s)}</button>`).join('')}
+        </div>
+      </div>
+      <div class="field">
+        <label>Temporada</label>
+        ${chipSelectHtml('temporada', TEMPORADAS, draft.temporada)}
+      </div>
+      <div class="field">
+        <label>Ocasión</label>
+        ${chipSelectHtml('ocasion', OCASIONES, draft.ocasion)}
+      </div>
+
+      ${
+        draft.color_principal
+          ? `<div class="field">
+              <label>Color detectado</label>
+              <div class="colores"><span class="swatch" style="background:${nameToHex(draft.color_principal)}"></span>${cap(draft.color_principal)}${
+              draft.color_secundario ? ' / <span class="swatch" style="background:' + nameToHex(draft.color_secundario) + '"></span>' + cap(draft.color_secundario) : ''
+            }</div>
+            </div>`
+          : ''
+      }
+
+      <button class="btn btn-primary btn-block" id="p-guardar" style="margin-top:10px;">${editing ? 'Guardar cambios' : 'Guardar prenda'}</button>
+    `;
+
+    $('#drawer-sub-back').addEventListener('click', () => (editing ? renderPrendaDetail(editId) : renderDrawerMenu()));
+    $('#foto-elegir').addEventListener('click', () => $('#foto-input').click());
+    $('#foto-input').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      $('#foto-preview').innerHTML = `<div class="spinner"></div>`;
+      try {
+        const result = await processGarmentPhoto(file);
+        draft.foto_recortada = result.dataUrl;
+        draft.color_principal = result.colorPrincipal;
+        draft.color_secundario = result.colorSecundario;
+        paint();
+      } catch (err) {
+        toast('No se pudo procesar la foto', 'error');
+        paint();
+      }
+    });
+    wireChipSelect(drawerContent, 'categoria', (v) => {
+      draft.categoria = v;
+      draft.subtipo = SUBTIPOS[v][0];
+      paint();
+    });
+    $('#p-subtipo-box').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) {
+        draft.subtipo = b.dataset.value;
+        paint();
+      }
+    });
+    wireChipSelect(drawerContent, 'temporada', (v) => (draft.temporada = v));
+    wireChipSelect(drawerContent, 'ocasion', (v) => (draft.ocasion = v));
+    $('#p-titulo').addEventListener('input', (e) => (draft.titulo = e.target.value));
+
+    $('#p-guardar').addEventListener('click', async () => {
+      if (!draft.titulo.trim()) return toast('Ponle un título a la prenda', 'error');
+      if (!draft.foto_recortada) return toast('Añade una foto', 'error');
+      if (editing) {
+        await DB.updatePrenda({ ...prenda, ...draft });
+        invalidatePrendasCache();
+        toast('Prenda actualizada');
+        renderPrendaDetail(editId);
+      } else {
+        const nueva = {
+          id: uid(),
+          ...draft,
+          fecha_anadida: todayStr(),
+          ultima_vez_usada: null,
+          veces_usada: 0,
+          activa: true,
+        };
+        await DB.addPrenda(nueva);
+        invalidatePrendasCache();
+        toast('Prenda añadida al vestidor');
+        renderWardrobeGrid();
+      }
+    });
+  };
+  paint();
+}
+
+async function renderGeminiConfig() {
+  const apiKey = (await DB.getConfig('gemini_api_key')) || '';
+  const model = (await DB.getConfig('gemini_model')) || 'gemini-2.0-flash';
+  const dias = (await DB.getConfig('dias_no_repetir')) ?? 14;
+
+  drawerContent.innerHTML = `
+    ${drawerHeaderHtml('GEMINI')}
+    <div class="field">
+      <label>API key de Gemini</label>
+      <input type="password" id="g-apikey" placeholder="Pega aquí tu API key" value="${escapeHtml(apiKey)}" />
+    </div>
+    <div class="field">
+      <label>Modelo</label>
+      <input type="text" id="g-model" value="${escapeHtml(model)}" />
+    </div>
+    <div class="field">
+      <label>Días sin repetir prenda</label>
+      <input type="number" id="g-dias" min="0" value="${dias}" />
+    </div>
+    <button class="btn btn-primary btn-block" id="g-guardar">Guardar</button>
+    <div class="screen-sub" style="margin-top:14px;">La API key se guarda solo en este dispositivo, nunca en el código de la app.</div>
+  `;
+  $('#drawer-sub-back').addEventListener('click', renderDrawerMenu);
+  $('#g-guardar').addEventListener('click', async () => {
+    await DB.setConfig('gemini_api_key', $('#g-apikey').value.trim());
+    await DB.setConfig('gemini_model', $('#g-model').value.trim() || 'gemini-2.0-flash');
+    await DB.setConfig('dias_no_repetir', parseInt($('#g-dias').value, 10) || 0);
+    toast('Configuración guardada');
+  });
+}
+
+function renderBackupPanel() {
+  drawerContent.innerHTML = `
+    ${drawerHeaderHtml('COPIA DE SEGURIDAD')}
+    <div class="screen-sub">Safari puede borrar los datos de una PWA que lleve tiempo sin usarse. Exporta una copia de vez en cuando para no perder tu vestidor.</div>
+    <button class="btn btn-primary btn-block" id="b-export" style="margin-bottom:12px;">Exportar datos</button>
+    <input type="file" id="b-import-input" accept="application/json" class="hidden" />
+    <button class="btn btn-outline btn-block" id="b-import">Importar datos</button>
+  `;
+  $('#drawer-sub-back').addEventListener('click', renderDrawerMenu);
+  $('#b-export').addEventListener('click', async () => {
+    await exportarDatos();
+    toast('Copia de seguridad descargada');
+  });
+  $('#b-import').addEventListener('click', () => $('#b-import-input').click());
+  $('#b-import-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      await importarDatos(file);
+      invalidatePrendasCache();
+      await reconcilePastOutfits();
+      toast('Datos importados correctamente');
+      renderDrawerMenu();
+    } catch (err) {
+      toast(err.message || 'No se pudo importar el archivo', 'error');
+    }
+  });
+}
+
+/* ===================== INIT ===================== */
+function wireGlobalEvents() {
+  document.getElementById('btn-open-settings').addEventListener('click', openDrawer);
+  document.getElementById('btn-close-settings').addEventListener('click', closeDrawer);
+  document.getElementById('drawer-backdrop').addEventListener('click', closeDrawer);
+}
+
+async function requestPersistentStorage() {
+  try {
+    if (navigator.storage && navigator.storage.persist) {
+      await navigator.storage.persist();
+    }
+  } catch (e) {
+    /* silencioso */
+  }
+}
+
+function registerServiceWorker() {
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
+  }
+}
+
+async function init() {
+  wireGlobalEvents();
+  await reconcilePastOutfits();
+  await renderHome();
+  requestPersistentStorage();
+  registerServiceWorker();
+}
+
+init();
