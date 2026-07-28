@@ -1,57 +1,55 @@
-// sw.js — cachea el "app shell" para que la PWA funcione offline.
-// Sube este número cada vez que cambies archivos para forzar la actualización.
-const CACHE_NAME = 'armario-cache-v1.1';
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>Vestidor</title>
+<meta name="description" content="Tu vestidor y tus outfits diarios" />
 
-const APP_SHELL = [
-  './',
-  './index.html',
-  './manifest.json',
-  './css/style.css',
-  './js/app.js',
-  './js/db.js',
-  './js/crop.js',
-  './js/colors.js',
-  './js/gemini.js',
-  './js/backup.js',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/icon-512-maskable.png',
-];
+<!-- PWA -->
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#0B0B0D" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Vestidor" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<link rel="icon" href="icons/icon-192.png" />
 
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting())
-  );
-});
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches
-      .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
-  );
-});
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <button id="btn-open-settings" class="icon-btn" aria-label="Configuración">
+      <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <div id="topbar-title">VESTIDOR</div>
+    <span class="icon-btn-spacer"></span>
+  </header>
 
-// Estrategia: cache-first para el app shell, network-first para todo lo demás
-// (por ejemplo, llamadas a la API de Gemini, que nunca deben servirse desde caché).
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
+  <main id="view"></main>
 
-  if (url.origin !== self.location.origin) {
-    return; // deja pasar peticiones externas (Gemini, Google Fonts) directamente a la red
-  }
+  <aside id="settings-drawer" class="drawer hidden">
+    <div class="drawer-backdrop" id="drawer-backdrop"></div>
+    <div class="drawer-panel">
+      <div class="drawer-header">
+        <span class="drawer-title">CONFIGURACIÓN</span>
+        <button id="btn-close-settings" class="icon-btn" aria-label="Cerrar">
+          <svg viewBox="0 0 24 24" width="22" height="22"><path d="M5 5l14 14M19 5L5 19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div id="drawer-content"></div>
+    </div>
+  </aside>
 
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request)
-        .then((res) => {
-          const resClone = res.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, resClone));
-          return res;
-        })
-        .catch(() => caches.match('./index.html'));
-    })
-  );
-});
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

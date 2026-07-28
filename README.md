@@ -1,76 +1,137 @@
-# Armario — outfits diarios
+// gemini.js — llamadas a la API de Gemini: generación de outfit + recorte de fondo por IA
+import { DB } from './db.js';
 
-PWA sin dependencias externas (HTML + CSS + JavaScript vanilla, sin build) para
-guardar tus prendas y planificar el outfit de cada día, a mano o con ayuda de
-la API de Gemini. Todo se guarda en el propio iPhone (IndexedDB); no hay
-backend.
+const DEFAULT_TEXT_MODEL = 'gemini-1.5-flash';
+const DEFAULT_IMAGE_MODEL = 'gemini-3.1-flash-image';
 
-## 1. Publicarla en GitHub Pages (gratis, sin Mac ni cuenta de desarrollador)
+function buildPrompt({ fecha, ocasion, temporada, ciudad, comentarios, candidatos }) {
+  const listado = candidatos
+    .map(
+      (p) =>
+        `- id: ${p.id} | categoria: ${p.categoria} | subtipo: ${p.subtipo} | color_principal: ${p.color_principal}` +
+        `${p.color_secundario ? ' | color_secundario: ' + p.color_secundario : ''} | temporada: ${p.temporada} | ocasion: ${p.ocasion} | titulo: ${p.titulo}`
+    )
+    .join('\n');
 
-1. Crea un repositorio nuevo en GitHub (puede ser público o privado; si es
-   privado necesitarás GitHub Pro para Pages).
-2. Sube **todo el contenido de esta carpeta** (no la carpeta en sí, sino su
-   contenido: `index.html`, `manifest.json`, `sw.js`, `css/`, `js/`, `icons/`)
-   a la raíz del repositorio. Puedes hacerlo desde el navegador con
-   "Add file → Upload files", arrastrando todos los archivos y carpetas.
-3. Ve a **Settings → Pages** del repositorio.
-4. En "Build and deployment", elige **Deploy from a branch**, rama `main`
-   (o `master`) y carpeta `/ (root)`. Guarda.
-5. Espera 1–2 minutos. GitHub te dará una URL del tipo
-   `https://tu-usuario.github.io/tu-repositorio/`.
+  return `Eres el estilista personal de una app de armario. Tu tarea es elegir UN outfit
+completo (una prenda de arriba, una de abajo y un calzado) a partir de las
+prendas candidatas que te doy, cada una acompañada de sus metadatos.
 
-Cada vez que cambies algo, vuelve a subir los archivos modificados (o usa git
-si lo prefieres) y sube en 1 el número de `CACHE_NAME` en `sw.js` para que los
-iPhones que ya tengan la app instalada descarguen la versión nueva.
+Contexto del día:
+- Fecha: ${fecha}
+- Ocasión: ${ocasion}
+- Temporada: ${temporada}
+- Ciudad: ${ciudad || 'no especificada'}
+- Comentarios: ${comentarios || 'ninguno'}
 
-## 2. Instalarla en el iPhone
+Reglas de elección:
+1. Elige exactamente una prenda de categoría "arriba", una de "abajo" y una de "calzado".
+2. Prioriza combinaciones de color armoniosas y coherentes con la ocasión y temporada indicada, así como con el clima que va a hacer en esa fecha en la ciudad indicada. Ten en cuenta también los posibles comentarios.
+3. Elige solo entre los IDs de esta lista de prendas candidatas (no inventes IDs):
+${listado}
 
-1. Abre la URL de GitHub Pages **en Safari** (tiene que ser Safari, no Chrome).
-2. Toca el icono de compartir (el cuadrado con la flecha hacia arriba).
-3. Elige **"Añadir a pantalla de inicio"**.
-4. Ábrela desde el icono de tu pantalla de inicio: se abrirá a pantalla
-   completa, como una app nativa.
+Responde únicamente con el outfit elegido y una razón breve, siguiendo el siguiente JSON:
+{
+  "prenda_arriba_id": "...",
+  "prenda_abajo_id": "...",
+  "prenda_calzado_id": "...",
+  "razonamiento": "breve explicación de la combinación elegida"
+}
+Debe ser explícitamente salida JSON estricta (sin texto extra) para poder parsear la respuesta sin fricción.`;
+}
 
-## 3. Configurar Gemini (opcional, para "Generar con Gemini")
+async function callGemini(model, body) {
+  const apiKey = await DB.getConfig('gemini_api_key');
+  if (!apiKey) {
+    throw new Error('No hay ninguna API key de Gemini configurada. Ve a Configuración > Gemini.');
+  }
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error('No se pudo conectar con Gemini (revisa tu conexión a internet).');
+  }
 
-1. Consigue una API key gratuita en https://aistudio.google.com/apikey
-2. Dentro de la app: icono de menú (arriba a la izquierda) → **Configuración
-   de Gemini** → pega tu API key → Guardar.
-3. La key se guarda solo en tu dispositivo (IndexedDB), nunca en el código ni
-   en ningún servidor de terceros.
+  if (res.status === 401 || res.status === 403) {
+    throw new Error('La API key de Gemini no es válida.');
+  }
+  if (res.status === 429) {
+    throw new Error('Se ha alcanzado el límite de peticiones a Gemini (rate limit). Inténtalo de nuevo en un momento.');
+  }
+  if (!res.ok) {
+    let detalle = '';
+    try {
+      const errJson = await res.json();
+      detalle = errJson?.error?.message ? `: ${errJson.error.message}` : '';
+    } catch (e) {
+      /* ignore */
+    }
+    throw new Error(`Gemini devolvió un error (${res.status})${detalle}.`);
+  }
+  return res.json();
+}
 
-## 4. Cómo funciona el recorte de fotos
+export async function generarOutfitConGemini({ fecha, ocasion, temporada, ciudad, comentarios, candidatos }) {
+  const model = (await DB.getConfig('gemini_model')) || DEFAULT_TEXT_MODEL;
+  const prompt = buildPrompt({ fecha, ocasion, temporada, ciudad, comentarios, candidatos });
 
-Al crear una prenda, elige siempre una foto tomada **sobre un fondo marrón
-uniforme**. La app detecta ese color de fondo automáticamente en las esquinas
-de la imagen, lo hace transparente y recorta la foto al contorno de la
-prenda — todo en el propio dispositivo, sin enviar la imagen a ningún sitio.
-El color principal y secundario de la prenda también se calculan solos a
-partir de los píxeles resultantes.
+  const data = await callGemini(model, {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0.7 },
+  });
 
-## 5. Copia de seguridad
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join('') || '';
+  let parsed;
+  try {
+    const clean = text.replace(/```json|```/g, '').trim();
+    parsed = JSON.parse(clean);
+  } catch (e) {
+    throw new Error('La respuesta de Gemini no se pudo interpretar como JSON.');
+  }
 
-Las PWA instaladas desde Safari pueden perder sus datos si Safari decide
-liberar espacio y llevas mucho tiempo sin abrir la app. Por eso, en
-**Configuración → Copia de seguridad** puedes exportar un archivo `.json` con
-todo tu vestidor, tus outfits y tus personas (fotos incluidas, en base64), y
-volver a importarlo cuando lo necesites. Se recomienda exportar de vez en
-cuando y guardar el archivo en iCloud Drive, Files, o donde prefieras.
+  const ids = candidatos.map((c) => c.id);
+  if (
+    !parsed.prenda_arriba_id ||
+    !parsed.prenda_abajo_id ||
+    !parsed.prenda_calzado_id ||
+    !ids.includes(parsed.prenda_arriba_id) ||
+    !ids.includes(parsed.prenda_abajo_id) ||
+    !ids.includes(parsed.prenda_calzado_id)
+  ) {
+    throw new Error('Gemini eligió prendas fuera de la lista de candidatas.');
+  }
 
-## Estructura del proyecto
+  return parsed;
+}
 
-```
-index.html          Esqueleto de la app
-manifest.json        Manifest de la PWA
-sw.js                 Service worker (funcionamiento offline)
-css/style.css         Estilos (tema oscuro + rojo)
-js/db.js               Capa de persistencia (IndexedDB)
-js/crop.js             Recorte de fondo + color dominante
-js/colors.js           Paleta de nombres de color en español
-js/gemini.js           Llamada a la API de Gemini
-js/backup.js           Exportar / importar copia de seguridad
-js/app.js              Toda la lógica de pantallas y navegación
-icons/                 Iconos de la PWA
-```
+/**
+ * Envía una foto a Gemini pidiéndole que quite el fondo y devuelve la imagen
+ * generada como dataURL. Se usa desde el interruptor "Recorte IA" al crear una prenda.
+ */
+export async function quitarFondoConGemini({ base64, mimeType }) {
+  const model = (await DB.getConfig('gemini_image_model')) || DEFAULT_IMAGE_MODEL;
 
-No hay paso de compilación: es HTML/CSS/JS servido tal cual.
+  const data = await callGemini(model, {
+    contents: [
+      {
+        parts: [{ text: 'Quita el fondo de la siguiente imagen' }, { inlineData: { mimeType, data: base64 } }],
+      },
+    ],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+  });
+
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const imgPart = parts.find((p) => p.inlineData || p.inline_data);
+  if (!imgPart) {
+    throw new Error('Gemini no devolvió ninguna imagen recortada.');
+  }
+  const inline = imgPart.inlineData || imgPart.inline_data;
+  const outMime = inline.mimeType || inline.mime_type || 'image/png';
+  const outData = inline.data;
+  return `data:${outMime};base64,${outData}`;
+}
