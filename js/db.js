@@ -1,5 +1,5 @@
 // db.js — capa de persistencia sobre IndexedDB
-const DB_NAME = 'armario-db';
+const DB_NAME = 'vestidor-db';
 const DB_VERSION = 1;
 let dbPromise = null;
 

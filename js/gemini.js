@@ -1,5 +1,8 @@
-// gemini.js — llamada a la API de Gemini para generar un outfit
+// gemini.js — llamadas a la API de Gemini: generación de outfit + recorte de fondo por IA
 import { DB } from './db.js';
+
+const DEFAULT_TEXT_MODEL = 'gemini-1.5-flash';
+const DEFAULT_IMAGE_MODEL = 'gemini-3.1-flash-image';
 
 function buildPrompt({ fecha, ocasion, temporada, ciudad, comentarios, candidatos }) {
   const listado = candidatos
@@ -37,24 +40,18 @@ Responde únicamente con el outfit elegido y una razón breve, siguiendo el sigu
 Debe ser explícitamente salida JSON estricta (sin texto extra) para poder parsear la respuesta sin fricción.`;
 }
 
-export async function generarOutfitConGemini({ fecha, ocasion, temporada, ciudad, comentarios, candidatos }) {
+async function callGemini(model, body) {
   const apiKey = await DB.getConfig('gemini_api_key');
   if (!apiKey) {
     throw new Error('No hay ninguna API key de Gemini configurada. Ve a Configuración > Gemini.');
   }
-  const model = (await DB.getConfig('gemini_model')) || 'gemini-2.0-flash';
-  const prompt = buildPrompt({ fecha, ocasion, temporada, ciudad, comentarios, candidatos });
-
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   let res;
   try {
     res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.7 },
-      }),
+      body: JSON.stringify(body),
     });
   } catch (e) {
     throw new Error('No se pudo conectar con Gemini (revisa tu conexión a internet).');
@@ -64,14 +61,31 @@ export async function generarOutfitConGemini({ fecha, ocasion, temporada, ciudad
     throw new Error('La API key de Gemini no es válida.');
   }
   if (res.status === 429) {
-    throw new Error('Se ha alcanzado el límite de peticiones a Gemini (rate limit). Inténtalo más tarde.');
+    throw new Error('Se ha alcanzado el límite de peticiones a Gemini (rate limit). Inténtalo de nuevo en un momento.');
   }
   if (!res.ok) {
-    throw new Error(`Gemini devolvió un error (${res.status}).`);
+    let detalle = '';
+    try {
+      const errJson = await res.json();
+      detalle = errJson?.error?.message ? `: ${errJson.error.message}` : '';
+    } catch (e) {
+      /* ignore */
+    }
+    throw new Error(`Gemini devolvió un error (${res.status})${detalle}.`);
   }
+  return res.json();
+}
 
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+export async function generarOutfitConGemini({ fecha, ocasion, temporada, ciudad, comentarios, candidatos }) {
+  const model = (await DB.getConfig('gemini_model')) || DEFAULT_TEXT_MODEL;
+  const prompt = buildPrompt({ fecha, ocasion, temporada, ciudad, comentarios, candidatos });
+
+  const data = await callGemini(model, {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: 'application/json', temperature: 0.7 },
+  });
+
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean).join('') || '';
   let parsed;
   try {
     const clean = text.replace(/```json|```/g, '').trim();
@@ -93,4 +107,31 @@ export async function generarOutfitConGemini({ fecha, ocasion, temporada, ciudad
   }
 
   return parsed;
+}
+
+/**
+ * Envía una foto a Gemini pidiéndole que quite el fondo y devuelve la imagen
+ * generada como dataURL. Se usa desde el interruptor "Recorte IA" al crear una prenda.
+ */
+export async function quitarFondoConGemini({ base64, mimeType }) {
+  const model = (await DB.getConfig('gemini_image_model')) || DEFAULT_IMAGE_MODEL;
+
+  const data = await callGemini(model, {
+    contents: [
+      {
+        parts: [{ text: 'Quita el fondo de la siguiente imagen' }, { inlineData: { mimeType, data: base64 } }],
+      },
+    ],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+  });
+
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const imgPart = parts.find((p) => p.inlineData || p.inline_data);
+  if (!imgPart) {
+    throw new Error('Gemini no devolvió ninguna imagen recortada.');
+  }
+  const inline = imgPart.inlineData || imgPart.inline_data;
+  const outMime = inline.mimeType || inline.mime_type || 'image/png';
+  const outData = inline.data;
+  return `data:${outMime};base64,${outData}`;
 }

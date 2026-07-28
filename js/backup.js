@@ -8,7 +8,7 @@ export async function exportarDatos() {
   const a = document.createElement('a');
   const fecha = new Date().toISOString().slice(0, 10);
   a.href = url;
-  a.download = `armario-backup-${fecha}.json`;
+  a.download = `vestidor-backup-${fecha}.json`;
   document.body.appendChild(a);
   a.click();
   a.remove();

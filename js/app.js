@@ -1,6 +1,6 @@
 import { DB, uid, todayStr } from './db.js';
-import { processGarmentPhoto } from './crop.js';
-import { generarOutfitConGemini } from './gemini.js';
+import { loadAndResizeImage, getPixelHexAt, dataUrlToBase64 } from './crop.js';
+import { generarOutfitConGemini, quitarFondoConGemini } from './gemini.js';
 import { exportarDatos, importarDatos } from './backup.js';
 import { PALETTE } from './colors.js';
 
@@ -14,6 +14,7 @@ const TEMPORADAS = ['verano', 'invierno', 'entretiempo'];
 const OCASIONES = ['casual', 'formal', 'deporte', 'fiesta'];
 const CATEGORIAS = ['arriba', 'abajo', 'calzado'];
 const CATEGORIA_LABEL = { arriba: 'Arriba', abajo: 'Abajo', calzado: 'Calzado' };
+const CIUDAD_POR_DEFECTO = 'Ciudad de Madrid, España';
 
 /* ===================== UTILIDADES ===================== */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -21,9 +22,16 @@ const $all = (sel, root = document) => [...root.querySelectorAll(sel)];
 const view = document.getElementById('view');
 
 function nameToHex(name) {
-  const c = PALETTE.find((p) => p.name === name);
-  if (!c) return '#888888';
-  return '#' + c.rgb.map((v) => v.toString(16).padStart(2, '0')).join('');
+  const c = PALETTE.find((p) => p.name === (name || '').toLowerCase().trim());
+  return c ? '#' + c.rgb.map((v) => v.toString(16).padStart(2, '0')).join('') : null;
+}
+function colorVisual(prenda, cual) {
+  // "cual" es 'principal' o 'secundario'. Prioriza el hex tomado con el pincel;
+  // si no existe, intenta adivinarlo a partir del texto escrito por el usuario.
+  const hex = cual === 'principal' ? prenda.color_principal_hex : prenda.color_secundario_hex;
+  if (hex) return hex;
+  const texto = cual === 'principal' ? prenda.color_principal : prenda.color_secundario;
+  return nameToHex(texto) || '#555555';
 }
 
 function addDays(fechaStr, n) {
@@ -58,14 +66,9 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-function chipSelectHtml(name, options, selected, capitalizeLabels = true) {
+function chipSelectHtml(name, options, selected) {
   return `<div class="chip-select" data-field="${name}">${options
-    .map(
-      (o) =>
-        `<button type="button" data-value="${escapeHtml(o)}" class="${o === selected ? 'active' : ''}">${
-          capitalizeLabels ? cap(o) : escapeHtml(o)
-        }</button>`
-    )
+    .map((o) => `<button type="button" data-value="${escapeHtml(o)}" class="${o === selected ? 'active' : ''}">${cap(o)}</button>`)
     .join('')}</div>`;
 }
 function wireChipSelect(root, name, onChange) {
@@ -80,11 +83,20 @@ function wireChipSelect(root, name, onChange) {
   });
 }
 
+function switchHtml(id, checked, label, sub) {
+  return `<div class="switch-row">
+    <div><div class="switch-label">${escapeHtml(label)}</div>${sub ? `<div class="switch-sub">${escapeHtml(sub)}</div>` : ''}</div>
+    <label class="switch">
+      <input type="checkbox" id="${id}" ${checked ? 'checked' : ''} />
+      <span class="track"><span class="thumb"></span></span>
+    </label>
+  </div>`;
+}
+
 /* ===================== ESTADO ===================== */
 const state = {
   selectedDate: todayStr(),
   calendarMonth: new Date(),
-  editOpen: false,
   manualDraft: null,
   geminiDraft: null,
 };
@@ -160,21 +172,12 @@ async function renderHome() {
   const { dow, dia, mes } = fmtFechaLarga(fecha);
   const hasOutfit = !!(outfit && (outfit.prenda_arriba_id || outfit.prenda_abajo_id || outfit.prenda_calzado_id));
 
-  const filaHtml = (categoria, id) => {
+  const tile = (categoria, id) => {
     const p = prendaMap.get(id);
-    if (!p) {
-      return `<div class="outfit-row empty"><span>Sin ${CATEGORIA_LABEL[categoria].toLowerCase()}</span></div>`;
-    }
-    return `<div class="outfit-row">
-      <div class="thumb"><img src="${p.foto_recortada}" alt="${escapeHtml(p.titulo)}" /></div>
-      <div class="meta">
-        <div class="cat-label">${CATEGORIA_LABEL[categoria]}</div>
-        <div class="titulo">${escapeHtml(p.titulo)}</div>
-        <div class="colores"><span class="swatch" style="background:${nameToHex(p.color_principal)}"></span>${escapeHtml(p.color_principal)}${
-      p.color_secundario ? ' / <span class="swatch" style="background:' + nameToHex(p.color_secundario) + '"></span>' + escapeHtml(p.color_secundario) : ''
-    }</div>
-      </div>
-    </div>`;
+    if (!p) return `<div class="photo-tile empty">Sin ${categoria === 'calzado' ? 'calzado' : categoria}</div>`;
+    return `<button type="button" class="photo-tile" data-open-prenda="${p.id}">
+      <img src="${p.foto_recortada}" alt="${escapeHtml(p.titulo)}" />
+    </button>`;
   };
 
   const personas = (outfit && outfit.personas) || [];
@@ -191,10 +194,10 @@ async function renderHome() {
 
     ${
       hasOutfit
-        ? `<div class="outfit-grid">
-            ${filaHtml('arriba', outfit.prenda_arriba_id)}
-            ${filaHtml('abajo', outfit.prenda_abajo_id)}
-            ${filaHtml('calzado', outfit.prenda_calzado_id)}
+        ? `<div class="photo-stack">
+            ${tile('arriba', outfit.prenda_arriba_id)}
+            ${tile('abajo', outfit.prenda_abajo_id)}
+            ${tile('calzado', outfit.prenda_calzado_id)}
           </div>
           ${
             personas.length
@@ -204,7 +207,17 @@ async function renderHome() {
               : ''
           }
           ${outfit.notas ? `<div class="reasoning-card">${escapeHtml(outfit.notas)}</div>` : ''}
-          `
+          <button class="btn btn-outline btn-block" id="btn-toggle-edit" style="margin-top:20px;">Editar outfit</button>
+          <div id="edit-outfit-options" class="hidden">
+            <button class="choice-card primary" id="btn-gemini">
+              <span class="emoji">✨</span>
+              <span><span class="title">Generar con Gemini</span></span>
+            </button>
+            <button class="choice-card" id="btn-manual">
+              <span class="emoji">✏️</span>
+              <span><span class="title">Crear a mano</span></span>
+            </button>
+          </div>`
         : `<div class="empty-state">
             <div class="icon">👔</div>
             <div>Todavía no hay outfit para este día</div>
@@ -220,20 +233,6 @@ async function renderHome() {
             </button>
           </div>`
     }
-
-    <button class="btn btn-outline btn-block" id="btn-toggle-edit" style="margin-top:20px;">
-      ${hasOutfit ? 'Editar outfit' : 'Opciones'}
-    </button>
-    <div id="edit-outfit-options" class="hidden">
-      <button class="choice-card primary" id="btn-gemini">
-        <span class="emoji">✨</span>
-        <span><span class="title">Generar con Gemini</span></span>
-      </button>
-      <button class="choice-card" id="btn-manual">
-        <span class="emoji">✏️</span>
-        <span><span class="title">Crear a mano</span></span>
-      </button>
-    </div>
   `;
 
   $('#date-prev').addEventListener('click', () => {
@@ -252,11 +251,105 @@ async function renderHome() {
   const goManual = () => renderManual();
   if ($('#btn-gemini-direct')) $('#btn-gemini-direct').addEventListener('click', goGemini);
   if ($('#btn-manual-direct')) $('#btn-manual-direct').addEventListener('click', goManual);
-  $('#btn-gemini').addEventListener('click', goGemini);
-  $('#btn-manual').addEventListener('click', goManual);
-  $('#btn-toggle-edit').addEventListener('click', () => {
-    $('#edit-outfit-options').classList.toggle('hidden');
+  if ($('#btn-gemini')) $('#btn-gemini').addEventListener('click', goGemini);
+  if ($('#btn-manual')) $('#btn-manual').addEventListener('click', goManual);
+  if ($('#btn-toggle-edit')) {
+    $('#btn-toggle-edit').addEventListener('click', () => {
+      $('#edit-outfit-options').classList.toggle('hidden');
+    });
+  }
+  $all('[data-open-prenda]').forEach((btn) => {
+    btn.addEventListener('click', () => openPrendaSheet(btn.dataset.openPrenda));
   });
+}
+
+/* ===================== FICHA DE PRENDA (ver + editar) ===================== */
+// Núcleo reutilizable: dibuja la ficha de una prenda dentro de cualquier contenedor.
+async function paintFicha({ container, id, allowDelete, onBack, onEdit, onDeleted, backIcon = '‹' }) {
+  const prenda = await DB.getPrenda(id);
+  if (!prenda) return;
+
+  container.innerHTML = `
+    <div class="screen-header" style="margin-bottom:14px;">
+      <button class="back-btn" id="ficha-back">${backIcon}</button>
+      <div class="screen-title" style="font-size:20px;">${escapeHtml(prenda.titulo)}</div>
+    </div>
+    <div class="detail-photo"><img src="${prenda.foto_recortada}" alt=""/></div>
+    <div class="detail-grid">
+      <div><div class="k">Categoría</div><div class="v">${CATEGORIA_LABEL[prenda.categoria]}</div></div>
+      <div><div class="k">Subtipo</div><div class="v">${cap(prenda.subtipo)}</div></div>
+      <div><div class="k">Color principal</div><div class="v"><span class="swatch" style="background:${colorVisual(prenda, 'principal')}"></span>${escapeHtml(
+    prenda.color_principal
+  )}</div></div>
+      <div><div class="k">Color secundario</div><div class="v">${
+        prenda.color_secundario
+          ? `<span class="swatch" style="background:${colorVisual(prenda, 'secundario')}"></span>${escapeHtml(prenda.color_secundario)}`
+          : '—'
+      }</div></div>
+      <div><div class="k">Temporada</div><div class="v">${cap(prenda.temporada)}</div></div>
+      <div><div class="k">Ocasión</div><div class="v">${cap(prenda.ocasion)}</div></div>
+      <div><div class="k">Veces usada</div><div class="v">${prenda.veces_usada || 0}</div></div>
+      <div><div class="k">Última vez</div><div class="v">${prenda.ultima_vez_usada || '—'}</div></div>
+      <div><div class="k">Añadida</div><div class="v">${prenda.fecha_anadida}</div></div>
+    </div>
+    <div class="action-row">
+      <button class="btn btn-outline btn-block" id="ficha-editar">Editar</button>
+      ${allowDelete ? `<button class="btn btn-danger" id="ficha-eliminar">Eliminar</button>` : ''}
+    </div>
+  `;
+  $('#ficha-back', container).addEventListener('click', onBack);
+  $('#ficha-editar', container).addEventListener('click', onEdit);
+  if (allowDelete && $('#ficha-eliminar', container)) {
+    $('#ficha-eliminar', container).addEventListener('click', () => {
+      openSheet(`
+        <div class="screen-title" style="margin-bottom:10px;">¿Eliminar "${escapeHtml(prenda.titulo)}"?</div>
+        <div class="screen-sub">No se borrará el histórico de outfits que la usaron.</div>
+        <div class="action-row">
+          <button class="btn btn-outline" id="del-cancel">Cancelar</button>
+          <button class="btn btn-danger" id="del-confirm">Eliminar</button>
+        </div>
+      `);
+      $('#del-cancel').addEventListener('click', closeSheet);
+      $('#del-confirm').addEventListener('click', async () => {
+        prenda.activa = false;
+        await DB.updatePrenda(prenda);
+        invalidatePrendasCache();
+        closeSheet();
+        toast('Prenda eliminada del vestidor');
+        onDeleted();
+      });
+    });
+  }
+}
+
+// Ficha abierta desde la Home al tocar una foto del outfit del día: sin opción de eliminar.
+function openPrendaSheet(id) {
+  const container = openSheet(`<div id="sheet-ficha"></div>`);
+  const inner = $('#sheet-ficha', container);
+
+  const showFicha = () =>
+    paintFicha({
+      container: inner,
+      id,
+      allowDelete: false,
+      backIcon: '✕',
+      onBack: () => {
+        closeSheet();
+        renderHome();
+      },
+      onEdit: showEdit,
+    });
+
+  const showEdit = () =>
+    paintPrendaForm({
+      container: inner,
+      editId: id,
+      backIcon: '‹',
+      onSaved: showFicha,
+      onCancel: showFicha,
+    });
+
+  showFicha();
 }
 
 /* ===================== CALENDARIO ===================== */
@@ -337,8 +430,8 @@ function dayCellHtml(dateObj, otherMonth, outfitMap, prendaMap, today) {
       .map((id) => {
         const p = prendaMap.get(id);
         if (!p) return `<div class="bar"><span style="width:100%;background:#333"></span></div>`;
-        const c1 = nameToHex(p.color_principal);
-        const c2 = p.color_secundario ? nameToHex(p.color_secundario) : null;
+        const c1 = colorVisual(p, 'principal');
+        const c2 = p.color_secundario ? colorVisual(p, 'secundario') : null;
         return `<div class="bar"><span style="width:${c2 ? '70%' : '100%'};background:${c1}"></span>${
           c2 ? `<span style="width:30%;background:${c2}"></span>` : ''
         }</div>`;
@@ -575,7 +668,7 @@ async function openPersonaPicker() {
 async function renderGeminiForm() {
   const fecha = state.selectedDate;
   if (!state.geminiDraft || state.geminiDraft.fecha !== fecha) {
-    state.geminiDraft = { fecha, ocasion: 'casual', temporada: 'entretiempo', personas: [], ciudad: '', comentarios: '' };
+    state.geminiDraft = { fecha, ocasion: 'casual', temporada: 'entretiempo', personas: [], ciudad: CIUDAD_POR_DEFECTO, comentarios: '' };
   }
   const draft = state.geminiDraft;
   const { dow, dia, mes } = fmtFechaLarga(fecha);
@@ -710,6 +803,8 @@ async function candidatosParaCategoria(categoria, { prendas, outfits, fecha, per
 
 async function handleGenerar() {
   const draft = state.geminiDraft;
+  if (!draft.ciudad || !draft.ciudad.trim()) draft.ciudad = CIUDAD_POR_DEFECTO;
+
   view.innerHTML = `
     <div class="screen-header"><div class="screen-title">GENERANDO...</div></div>
     <div class="loading-block"><div class="spinner"></div><span>Consultando a tu estilista...</span></div>
@@ -828,6 +923,264 @@ async function renderGeminiResult(resultado) {
   });
 }
 
+/* ===================== EYEDROPPER (pincel de color) ===================== */
+// Abre un selector visual sobre la foto para tomar el color de un píxel exacto.
+function openEyedropper(dataUrl, onPick) {
+  const sheet = openSheet(`
+    <div class="screen-title" style="margin-bottom:6px;">Elige un color de la prenda</div>
+    <div class="eyedropper-hint">Toca cualquier punto de la foto para tomar ese color</div>
+    <div class="eyedropper-wrap" id="eyedropper-wrap">
+      <img src="${dataUrl}" alt="" id="eyedropper-img" />
+    </div>
+    <div class="eyedropper-preview" id="eyedropper-preview"></div>
+    <button class="btn btn-primary btn-block" id="eyedropper-done" style="margin-top:16px;" disabled>Usar este color</button>
+  `);
+  const wrap = $('#eyedropper-wrap', sheet);
+  const img = $('#eyedropper-img', sheet);
+  const preview = $('#eyedropper-preview', sheet);
+  const doneBtn = $('#eyedropper-done', sheet);
+  let picked = null;
+
+  const pickAt = async (clientX, clientY) => {
+    const rect = img.getBoundingClientRect();
+    const xFraction = (clientX - rect.left) / rect.width;
+    const yFraction = (clientY - rect.top) / rect.height;
+    if (xFraction < 0 || xFraction > 1 || yFraction < 0 || yFraction > 1) return;
+
+    $all('.eyedropper-marker', wrap).forEach((m) => m.remove());
+    const marker = document.createElement('div');
+    marker.className = 'eyedropper-marker';
+    marker.style.left = `${xFraction * 100}%`;
+    marker.style.top = `${yFraction * 100}%`;
+    wrap.appendChild(marker);
+
+    const hex = await getPixelHexAt(dataUrl, xFraction, yFraction);
+    picked = hex;
+    preview.innerHTML = `<span class="swatch-big" style="background:${hex}"></span><span>${hex}</span>`;
+    doneBtn.disabled = false;
+  };
+
+  img.addEventListener('click', (e) => pickAt(e.clientX, e.clientY));
+
+  doneBtn.addEventListener('click', () => {
+    if (!picked) return;
+    closeSheet();
+    onPick(picked);
+  });
+}
+
+/* ===================== CREAR / EDITAR PRENDA (reutilizable) ===================== */
+// Formulario reutilizable de creación/edición de prenda: puede pintarse tanto en el
+// cajón de configuración como dentro de una hoja modal (al editar desde la Home).
+async function paintPrendaForm({ container, editId = null, backIcon = '‹', onSaved, onCancel }) {
+  const editing = !!editId;
+  const original = editing ? await DB.getPrenda(editId) : null;
+
+  const draft = editing
+    ? { ...original }
+    : {
+        titulo: '',
+        categoria: 'arriba',
+        subtipo: SUBTIPOS.arriba[0],
+        temporada: 'entretiempo',
+        ocasion: 'casual',
+        foto_original: null,
+        foto_recortada: null,
+        fotoMime: 'image/png',
+        recorte_ia: true,
+        color_principal: '',
+        color_principal_hex: null,
+        color_secundario: '',
+        color_secundario_hex: null,
+      };
+  if (editing && draft.recorte_ia === undefined) draft.recorte_ia = true;
+  if (editing && !draft.foto_original) draft.foto_original = draft.foto_recortada;
+
+  let procesando = false;
+
+  const runRecorteIA = async () => {
+    if (!draft.foto_original) return;
+    const { base64, mimeType } = dataUrlToBase64(draft.foto_original);
+    if (!base64) return;
+    procesando = true;
+    paint();
+    try {
+      const resultado = await quitarFondoConGemini({ base64, mimeType });
+      draft.foto_recortada = resultado;
+      toast('Fondo recortado con IA');
+    } catch (err) {
+      toast(err.message || 'No se pudo recortar el fondo con IA', 'error');
+      draft.foto_recortada = draft.foto_original;
+    }
+    procesando = false;
+    paint();
+  };
+
+  const paint = () => {
+    container.innerHTML = `
+      <div class="screen-header" style="margin-bottom:14px;">
+        <button class="back-btn" id="pf-back">${backIcon}</button>
+        <div class="screen-title" style="font-size:20px;">${editing ? 'EDITAR PRENDA' : 'CREAR PRENDA'}</div>
+      </div>
+
+      <div class="field">
+        <label>Foto</label>
+        <div class="detail-photo ${procesando ? 'photo-processing' : ''}" id="foto-preview">
+          ${
+            procesando
+              ? `<div class="processing-overlay"><div class="spinner"></div><span>Recortando con IA...</span></div>`
+              : draft.foto_recortada
+              ? `<img src="${draft.foto_recortada}" alt=""/>`
+              : `<span style="color:var(--text-faint);font-size:13px;">Sin foto todavía</span>`
+          }
+        </div>
+        <input type="file" id="foto-input" accept="image/*" class="hidden" />
+        <button type="button" class="btn btn-outline btn-block" id="foto-elegir" ${procesando ? 'disabled' : ''}>${
+      draft.foto_recortada ? 'Cambiar foto' : 'Elegir foto de la galería'
+    }</button>
+        ${switchHtml('sw-recorte-ia', draft.recorte_ia, 'Recorte IA', 'Al importar, Gemini quita el fondo automáticamente')}
+      </div>
+
+      <div class="field">
+        <label>Título</label>
+        <input type="text" id="p-titulo" placeholder="Ej: Camisa vaquera" value="${escapeHtml(draft.titulo)}" />
+      </div>
+
+      <div class="field">
+        <label>Categoría</label>
+        <div class="chip-select" data-field="categoria">
+          ${CATEGORIAS.map((c) => `<button type="button" data-value="${c}" class="${draft.categoria === c ? 'active' : ''}">${CATEGORIA_LABEL[c]}</button>`).join('')}
+        </div>
+      </div>
+      <div class="field">
+        <label>Subtipo</label>
+        <div class="chip-select" id="p-subtipo-box">
+          ${SUBTIPOS[draft.categoria].map((s) => `<button type="button" data-value="${s}" class="${draft.subtipo === s ? 'active' : ''}">${cap(s)}</button>`).join('')}
+        </div>
+      </div>
+      <div class="field">
+        <label>Temporada</label>
+        ${chipSelectHtml('temporada', TEMPORADAS, draft.temporada)}
+      </div>
+      <div class="field">
+        <label>Ocasión</label>
+        ${chipSelectHtml('ocasion', OCASIONES, draft.ocasion)}
+      </div>
+
+      <div class="field">
+        <label>Color principal</label>
+        <input type="text" id="p-color1" placeholder="Ej: azul marino" value="${escapeHtml(draft.color_principal)}" />
+        <div class="eyedropper-preview">
+          ${draft.color_principal_hex ? `<span class="swatch-big" style="background:${draft.color_principal_hex}"></span><span>${draft.color_principal_hex}</span>` : `<span class="screen-sub" style="margin:0;">Sin color tomado con el pincel</span>`}
+        </div>
+        <button type="button" class="btn btn-outline btn-block" id="p-pick1" ${draft.foto_recortada ? '' : 'disabled'} style="margin-top:8px;">🖌️ Tomar color de la foto</button>
+      </div>
+
+      <div class="field">
+        <label>Color secundario (opcional)</label>
+        <input type="text" id="p-color2" placeholder="Ej: blanco" value="${escapeHtml(draft.color_secundario || '')}" />
+        <div class="eyedropper-preview">
+          ${draft.color_secundario_hex ? `<span class="swatch-big" style="background:${draft.color_secundario_hex}"></span><span>${draft.color_secundario_hex}</span>` : `<span class="screen-sub" style="margin:0;">Sin color tomado con el pincel</span>`}
+        </div>
+        <button type="button" class="btn btn-outline btn-block" id="p-pick2" ${draft.foto_recortada ? '' : 'disabled'} style="margin-top:8px;">🖌️ Tomar color de la foto</button>
+      </div>
+
+      <button class="btn btn-primary btn-block" id="p-guardar" style="margin-top:10px;" ${procesando ? 'disabled' : ''}>${editing ? 'Guardar cambios' : 'Guardar prenda'}</button>
+    `;
+
+    $('#pf-back', container).addEventListener('click', onCancel);
+    $('#foto-elegir', container).addEventListener('click', () => $('#foto-input', container).click());
+    $('#foto-input', container).addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      try {
+        const { dataUrl } = await loadAndResizeImage(file);
+        draft.foto_original = dataUrl;
+        draft.foto_recortada = dataUrl;
+        if (draft.recorte_ia) {
+          await runRecorteIA();
+        } else {
+          paint();
+        }
+      } catch (err) {
+        toast('No se pudo cargar la foto', 'error');
+      }
+    });
+    $('#sw-recorte-ia', container).addEventListener('change', async (e) => {
+      draft.recorte_ia = e.target.checked;
+      if (!draft.foto_original) return;
+      if (draft.recorte_ia) {
+        await runRecorteIA();
+      } else {
+        draft.foto_recortada = draft.foto_original;
+        paint();
+      }
+    });
+    wireChipSelect(container, 'categoria', (v) => {
+      draft.categoria = v;
+      draft.subtipo = SUBTIPOS[v][0];
+      paint();
+    });
+    $('#p-subtipo-box', container).addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) {
+        draft.subtipo = b.dataset.value;
+        paint();
+      }
+    });
+    wireChipSelect(container, 'temporada', (v) => (draft.temporada = v));
+    wireChipSelect(container, 'ocasion', (v) => (draft.ocasion = v));
+    $('#p-titulo', container).addEventListener('input', (e) => (draft.titulo = e.target.value));
+    $('#p-color1', container).addEventListener('input', (e) => (draft.color_principal = e.target.value));
+    $('#p-color2', container).addEventListener('input', (e) => (draft.color_secundario = e.target.value));
+
+    if ($('#p-pick1', container)) {
+      $('#p-pick1', container).addEventListener('click', () => {
+        openEyedropper(draft.foto_recortada, (hex) => {
+          draft.color_principal_hex = hex;
+          paint();
+        });
+      });
+    }
+    if ($('#p-pick2', container)) {
+      $('#p-pick2', container).addEventListener('click', () => {
+        openEyedropper(draft.foto_recortada, (hex) => {
+          draft.color_secundario_hex = hex;
+          paint();
+        });
+      });
+    }
+
+    $('#p-guardar', container).addEventListener('click', async () => {
+      if (!draft.titulo.trim()) return toast('Ponle un título a la prenda', 'error');
+      if (!draft.foto_recortada) return toast('Añade una foto', 'error');
+      if (!draft.color_principal || !draft.color_principal.trim()) return toast('Escribe el color principal', 'error');
+
+      if (editing) {
+        const actualizada = { ...original, ...draft };
+        await DB.updatePrenda(actualizada);
+        invalidatePrendasCache();
+        toast('Prenda actualizada');
+        onSaved(actualizada);
+      } else {
+        const nueva = {
+          id: uid(),
+          ...draft,
+          fecha_anadida: todayStr(),
+          ultima_vez_usada: null,
+          veces_usada: 0,
+          activa: true,
+        };
+        await DB.addPrenda(nueva);
+        invalidatePrendasCache();
+        toast('Prenda añadida al vestidor');
+        onSaved(nueva);
+      }
+    });
+  };
+  paint();
+}
+
 /* ===================== SETTINGS DRAWER ===================== */
 const drawer = document.getElementById('settings-drawer');
 const drawerContent = document.getElementById('drawer-content');
@@ -848,7 +1201,14 @@ function renderDrawerMenu() {
     <button class="settings-item" data-go="backup">Copia de seguridad <span class="arrow">›</span></button>
   `;
   $('[data-go="wardrobe"]', drawerContent).addEventListener('click', () => renderWardrobeGrid());
-  $('[data-go="crear"]', drawerContent).addEventListener('click', () => renderCrearPrenda());
+  $('[data-go="crear"]', drawerContent).addEventListener('click', () =>
+    paintPrendaForm({
+      container: drawerContent,
+      editId: null,
+      onSaved: () => renderWardrobeGrid(),
+      onCancel: () => renderDrawerMenu(),
+    })
+  );
   $('[data-go="gemini"]', drawerContent).addEventListener('click', () => renderGeminiConfig());
   $('[data-go="backup"]', drawerContent).addEventListener('click', () => renderBackupPanel());
 }
@@ -874,7 +1234,7 @@ async function renderWardrobeGrid() {
       if (ocasionFiltro && p.ocasion !== ocasionFiltro) return false;
       if (query) {
         const q = query.toLowerCase();
-        if (!(p.titulo.toLowerCase().includes(q) || p.subtipo.toLowerCase().includes(q) || p.color_principal.toLowerCase().includes(q))) return false;
+        if (!(p.titulo.toLowerCase().includes(q) || p.subtipo.toLowerCase().includes(q) || (p.color_principal || '').toLowerCase().includes(q))) return false;
       }
       return true;
     });
@@ -948,180 +1308,28 @@ async function renderWardrobeGrid() {
   paint();
 }
 
-async function renderPrendaDetail(id) {
-  const prenda = await DB.getPrenda(id);
-  if (!prenda) return renderWardrobeGrid();
-
-  drawerContent.innerHTML = `
-    ${drawerHeaderHtml(prenda.titulo)}
-    <div class="detail-photo"><img src="${prenda.foto_recortada}" alt=""/></div>
-    <div class="detail-grid">
-      <div><div class="k">Categoría</div><div class="v">${CATEGORIA_LABEL[prenda.categoria]}</div></div>
-      <div><div class="k">Subtipo</div><div class="v">${cap(prenda.subtipo)}</div></div>
-      <div><div class="k">Color principal</div><div class="v"><span class="swatch" style="background:${nameToHex(prenda.color_principal)}"></span>${cap(
-    prenda.color_principal
-  )}</div></div>
-      <div><div class="k">Color secundario</div><div class="v">${
-        prenda.color_secundario ? `<span class="swatch" style="background:${nameToHex(prenda.color_secundario)}"></span>${cap(prenda.color_secundario)}` : '—'
-      }</div></div>
-      <div><div class="k">Temporada</div><div class="v">${cap(prenda.temporada)}</div></div>
-      <div><div class="k">Ocasión</div><div class="v">${cap(prenda.ocasion)}</div></div>
-      <div><div class="k">Veces usada</div><div class="v">${prenda.veces_usada || 0}</div></div>
-      <div><div class="k">Última vez</div><div class="v">${prenda.ultima_vez_usada || '—'}</div></div>
-      <div><div class="k">Añadida</div><div class="v">${prenda.fecha_anadida}</div></div>
-    </div>
-    <div class="action-row">
-      <button class="btn btn-outline" id="prenda-editar">Editar</button>
-      <button class="btn btn-danger" id="prenda-eliminar">Eliminar</button>
-    </div>
-  `;
-  $('#drawer-sub-back').addEventListener('click', renderWardrobeGrid);
-  $('#prenda-editar').addEventListener('click', () => renderCrearPrenda(prenda.id));
-  $('#prenda-eliminar').addEventListener('click', () => {
-    openSheet(`
-      <div class="screen-title" style="margin-bottom:10px;">¿Eliminar "${escapeHtml(prenda.titulo)}"?</div>
-      <div class="screen-sub">No se borrará el histórico de outfits que la usaron.</div>
-      <div class="action-row">
-        <button class="btn btn-outline" id="del-cancel">Cancelar</button>
-        <button class="btn btn-danger" id="del-confirm">Eliminar</button>
-      </div>
-    `);
-    $('#del-cancel').addEventListener('click', closeSheet);
-    $('#del-confirm').addEventListener('click', async () => {
-      prenda.activa = false;
-      await DB.updatePrenda(prenda);
-      invalidatePrendasCache();
-      closeSheet();
-      toast('Prenda eliminada del vestidor');
-      renderWardrobeGrid();
-    });
+function renderPrendaDetail(id) {
+  paintFicha({
+    container: drawerContent,
+    id,
+    allowDelete: true,
+    backIcon: '‹',
+    onBack: renderWardrobeGrid,
+    onEdit: () =>
+      paintPrendaForm({
+        container: drawerContent,
+        editId: id,
+        onSaved: () => renderPrendaDetail(id),
+        onCancel: () => renderPrendaDetail(id),
+      }),
+    onDeleted: renderWardrobeGrid,
   });
-}
-
-async function renderCrearPrenda(editId = null) {
-  const editing = !!editId;
-  const prenda = editing ? await DB.getPrenda(editId) : null;
-
-  const draft = editing
-    ? { ...prenda }
-    : { titulo: '', categoria: 'arriba', subtipo: SUBTIPOS.arriba[0], temporada: 'entretiempo', ocasion: 'casual', foto_recortada: null, color_principal: null, color_secundario: null };
-
-  const paint = () => {
-    drawerContent.innerHTML = `
-      ${drawerHeaderHtml(editing ? 'EDITAR PRENDA' : 'CREAR PRENDA')}
-
-      <div class="field">
-        <label>Foto</label>
-        <div class="detail-photo" id="foto-preview">
-          ${draft.foto_recortada ? `<img src="${draft.foto_recortada}" alt=""/>` : `<span style="color:var(--text-faint);font-size:13px;">Sin foto todavía</span>`}
-        </div>
-        <input type="file" id="foto-input" accept="image/*" class="hidden" />
-        <button type="button" class="btn btn-outline btn-block" id="foto-elegir">${draft.foto_recortada ? 'Cambiar foto' : 'Elegir foto de la galería'}</button>
-      </div>
-
-      <div class="field">
-        <label>Título</label>
-        <input type="text" id="p-titulo" placeholder="Ej: Camisa vaquera" value="${escapeHtml(draft.titulo)}" />
-      </div>
-
-      <div class="field">
-        <label>Categoría</label>
-        <div class="chip-select" data-field="categoria">
-          ${CATEGORIAS.map((c) => `<button type="button" data-value="${c}" class="${draft.categoria === c ? 'active' : ''}">${CATEGORIA_LABEL[c]}</button>`).join('')}
-        </div>
-      </div>
-      <div class="field">
-        <label>Subtipo</label>
-        <div class="chip-select" id="p-subtipo-box">
-          ${SUBTIPOS[draft.categoria].map((s) => `<button type="button" data-value="${s}" class="${draft.subtipo === s ? 'active' : ''}">${cap(s)}</button>`).join('')}
-        </div>
-      </div>
-      <div class="field">
-        <label>Temporada</label>
-        ${chipSelectHtml('temporada', TEMPORADAS, draft.temporada)}
-      </div>
-      <div class="field">
-        <label>Ocasión</label>
-        ${chipSelectHtml('ocasion', OCASIONES, draft.ocasion)}
-      </div>
-
-      ${
-        draft.color_principal
-          ? `<div class="field">
-              <label>Color detectado</label>
-              <div class="colores"><span class="swatch" style="background:${nameToHex(draft.color_principal)}"></span>${cap(draft.color_principal)}${
-              draft.color_secundario ? ' / <span class="swatch" style="background:' + nameToHex(draft.color_secundario) + '"></span>' + cap(draft.color_secundario) : ''
-            }</div>
-            </div>`
-          : ''
-      }
-
-      <button class="btn btn-primary btn-block" id="p-guardar" style="margin-top:10px;">${editing ? 'Guardar cambios' : 'Guardar prenda'}</button>
-    `;
-
-    $('#drawer-sub-back').addEventListener('click', () => (editing ? renderPrendaDetail(editId) : renderDrawerMenu()));
-    $('#foto-elegir').addEventListener('click', () => $('#foto-input').click());
-    $('#foto-input').addEventListener('change', async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      $('#foto-preview').innerHTML = `<div class="spinner"></div>`;
-      try {
-        const result = await processGarmentPhoto(file);
-        draft.foto_recortada = result.dataUrl;
-        draft.color_principal = result.colorPrincipal;
-        draft.color_secundario = result.colorSecundario;
-        paint();
-      } catch (err) {
-        toast('No se pudo procesar la foto', 'error');
-        paint();
-      }
-    });
-    wireChipSelect(drawerContent, 'categoria', (v) => {
-      draft.categoria = v;
-      draft.subtipo = SUBTIPOS[v][0];
-      paint();
-    });
-    $('#p-subtipo-box').addEventListener('click', (e) => {
-      const b = e.target.closest('button');
-      if (b) {
-        draft.subtipo = b.dataset.value;
-        paint();
-      }
-    });
-    wireChipSelect(drawerContent, 'temporada', (v) => (draft.temporada = v));
-    wireChipSelect(drawerContent, 'ocasion', (v) => (draft.ocasion = v));
-    $('#p-titulo').addEventListener('input', (e) => (draft.titulo = e.target.value));
-
-    $('#p-guardar').addEventListener('click', async () => {
-      if (!draft.titulo.trim()) return toast('Ponle un título a la prenda', 'error');
-      if (!draft.foto_recortada) return toast('Añade una foto', 'error');
-      if (editing) {
-        await DB.updatePrenda({ ...prenda, ...draft });
-        invalidatePrendasCache();
-        toast('Prenda actualizada');
-        renderPrendaDetail(editId);
-      } else {
-        const nueva = {
-          id: uid(),
-          ...draft,
-          fecha_anadida: todayStr(),
-          ultima_vez_usada: null,
-          veces_usada: 0,
-          activa: true,
-        };
-        await DB.addPrenda(nueva);
-        invalidatePrendasCache();
-        toast('Prenda añadida al vestidor');
-        renderWardrobeGrid();
-      }
-    });
-  };
-  paint();
 }
 
 async function renderGeminiConfig() {
   const apiKey = (await DB.getConfig('gemini_api_key')) || '';
-  const model = (await DB.getConfig('gemini_model')) || 'gemini-2.0-flash';
+  const model = (await DB.getConfig('gemini_model')) || 'gemini-1.5-flash';
+  const imageModel = (await DB.getConfig('gemini_image_model')) || 'gemini-3.1-flash-image';
   const dias = (await DB.getConfig('dias_no_repetir')) ?? 14;
 
   drawerContent.innerHTML = `
@@ -1131,8 +1339,12 @@ async function renderGeminiConfig() {
       <input type="password" id="g-apikey" placeholder="Pega aquí tu API key" value="${escapeHtml(apiKey)}" />
     </div>
     <div class="field">
-      <label>Modelo</label>
+      <label>Modelo (generar outfit)</label>
       <input type="text" id="g-model" value="${escapeHtml(model)}" />
+    </div>
+    <div class="field">
+      <label>Modelo (recorte de imagen IA)</label>
+      <input type="text" id="g-image-model" value="${escapeHtml(imageModel)}" />
     </div>
     <div class="field">
       <label>Días sin repetir prenda</label>
@@ -1144,7 +1356,8 @@ async function renderGeminiConfig() {
   $('#drawer-sub-back').addEventListener('click', renderDrawerMenu);
   $('#g-guardar').addEventListener('click', async () => {
     await DB.setConfig('gemini_api_key', $('#g-apikey').value.trim());
-    await DB.setConfig('gemini_model', $('#g-model').value.trim() || 'gemini-2.0-flash');
+    await DB.setConfig('gemini_model', $('#g-model').value.trim() || 'gemini-1.5-flash');
+    await DB.setConfig('gemini_image_model', $('#g-image-model').value.trim() || 'gemini-3.1-flash-image');
     await DB.setConfig('dias_no_repetir', parseInt($('#g-dias').value, 10) || 0);
     toast('Configuración guardada');
   });
